@@ -3,14 +3,13 @@ import json
 import asyncio
 import random
 from datetime import datetime
-from typing import Optional
 
 from livekit.agents import function_tool, RunContext
 
 import config.constants as cfg
 from OPUS_routes import (
-    get_clinic_treatments, get_clinic_timeslots, book_opus_appointment,
-    get_clinicians, OPUS_PREFERRED_CLINICIAN_ID, OPUS_CLINIC_ID,
+    find_patient_slot,
+    book_existing_patient, book_new_patient,
 )
 from config.constants import BOOK_TIME_URL
 
@@ -60,8 +59,8 @@ class BookingToolsMixin:
         chosen = slots[slot_number - 1]
         self.call_data.selected_timeslot = chosen
 
-        start = chosen.get('Start') or chosen.get('start') or ''
-        end = chosen.get('End') or chosen.get('end') or ''
+        start = chosen.get('slotStart') or chosen.get('Start') or chosen.get('start') or ''
+        end = chosen.get('slotEnd') or chosen.get('End') or chosen.get('end') or ''
         try:
             dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
         except (ValueError, AttributeError):
@@ -78,16 +77,33 @@ class BookingToolsMixin:
         if self.call_data.selected_clinician:
             clinician_name = self.call_data.selected_clinician.get("name", "")
 
-        if lang == "en":
-            msg = f"You selected the {time_str} to {end_str} slot"
-            if clinician_name:
-                msg += f" with {clinician_name}"
-            msg += ". Can I have your full name please?"
+        is_existing = chosen.get("isExistingPatient", False)
+        patient_first = chosen.get("patientFirstName", "") or ""
+        patient_last = chosen.get("patientLastName", "") or ""
+        patient_name = f"{patient_first} {patient_last}".strip()
+
+        if is_existing and patient_name:
+            if lang == "en":
+                msg = f"You selected the {time_str} to {end_str} slot"
+                if clinician_name:
+                    msg += f" with {clinician_name}"
+                msg += f". I see you're already registered as {patient_name}. Shall I go ahead and book this for you?"
+            else:
+                msg = f"Du valgte timen fra klokken {time_str} til {end_str}"
+                if clinician_name:
+                    msg += f" hos {clinician_name}"
+                msg += f". Jeg ser du allerede er registrert som {patient_name}. Skal jeg booke denne for deg?"
         else:
-            msg = f"Du valgte timen fra klokken {time_str} til {end_str}"
-            if clinician_name:
-                msg += f" hos {clinician_name}"
-            msg += ". Kan jeg få fulle navnet ditt?"
+            if lang == "en":
+                msg = f"You selected the {time_str} to {end_str} slot"
+                if clinician_name:
+                    msg += f" with {clinician_name}"
+                msg += ". Can I have your full name please?"
+            else:
+                msg = f"Du valgte timen fra klokken {time_str} til {end_str}"
+                if clinician_name:
+                    msg += f" hos {clinician_name}"
+                msg += ". Kan jeg få fulle navnet ditt?"
         return msg
 
     @function_tool()
@@ -184,8 +200,15 @@ class BookingToolsMixin:
             print("[TOOL] get_available_timeslots: No business_id in call_data")
             return "Unable to check availability at the moment." if lang == "en" else "Kan ikke sjekke tilgjengelighet for øyeblikket."
         
-        print(f"[TOOL] get_available_timeslots: Finding slot for treatment_id={treatment_id}, business_id={business_id}")
-        
+        pid = self.call_data.collected_personnummer if self.call_data else ""
+        if not pid:
+            print("[TOOL] get_available_timeslots: No personnummer collected yet")
+            if lang == "en":
+                return "I need your personal ID number before I can check availability. Please provide it first."
+            return "Jeg trenger personnummeret ditt før jeg kan sjekke tilgjengelighet. Vennligst oppgi det først."
+
+        print(f"[TOOL] get_available_timeslots: Finding slot for treatment='{treatment_display_name}', business_id={business_id}")
+
         starting_from = None
         if desired_date and desired_date.strip():
             try:
@@ -194,59 +217,51 @@ class BookingToolsMixin:
             except ValueError:
                 print(f"[TOOL] get_available_timeslots: invalid desired_date '{desired_date}', using current time")
 
-        clinic_id = OPUS_CLINIC_ID
         try:
-            clinicians = await get_clinicians(business_id, clinic_id, treatment_id)
-            preferred_clinician = next(
-                (c for c in clinicians if c.get('id') == OPUS_PREFERRED_CLINICIAN_ID and c.get('active', False)),
-                None
-            )
+            slots = await find_patient_slot(business_id, pid, treatment_display_name, starting_from)
+            found_slots = [s for s in slots if s.get("found")]
 
-            if not preferred_clinician:
-                print(f"[TOOL] Preferred clinician {OPUS_PREFERRED_CLINICIAN_ID} not found/active for treatment {treatment_id}")
-                if lang == "en":
-                    return f"Sorry, the dentist is not available for {treatment_display_name} at the moment. Would you like to check another treatment or try a different date?"
-                return f"Beklager, tannlegen er ikke tilgjengelig for {treatment_display_name} for øyeblikket. Vil du prøve en annen behandling eller en annen dato?"
-
-            timeslots = await get_clinic_timeslots(
-                business_id, treatment_id,
-                starting_from=starting_from,
-                clinic_id=clinic_id,
-                clinician_id=OPUS_PREFERRED_CLINICIAN_ID
-            )
-
-            if not timeslots:
+            if not found_slots:
+                not_found_reason = next((s.get("reason") for s in slots if not s.get("found") and s.get("reason")), None)
+                print(f"[TOOL] get_available_timeslots: no slots found. Reason: {not_found_reason}")
                 if lang == "en":
                     return f"Sorry, the dentist has no available appointments for {treatment_display_name} right now. Would you like to check another date?"
                 return f"Beklager, tannlegen har ingen ledige timer for {treatment_display_name} akkurat nå. Vil du prøve en annen dato?"
 
-            clinician_name = preferred_clinician.get("name", "")
-            clinician_title = preferred_clinician.get("title", "Tannlege")
+            first_slot = found_slots[0]
+            clinician_name = first_slot.get("clinicianName", "")
+            clinician_title = "Tannlege"
 
             if self.call_data:
+                if first_slot.get("treatmentId"):
+                    self.call_data.selected_treatment_id = first_slot["treatmentId"]
+                if first_slot.get("patientFirstName"):
+                    self.call_data.customer_first_name = first_slot["patientFirstName"]
+                if first_slot.get("patientLastName"):
+                    self.call_data.customer_last_name = first_slot["patientLastName"]
                 self.call_data.selected_clinician = {
-                    "id": preferred_clinician.get("id"),
+                    "id": first_slot.get("clinicianId"),
                     "name": clinician_name,
                     "title": clinician_title,
                 }
 
-            max_slots = min(len(timeslots), 5)
-            display_slots = timeslots[:max_slots]
+            max_slots = min(len(found_slots), 5)
+            display_slots = found_slots[:max_slots]
 
             if self.call_data:
                 self.call_data.available_timeslots = display_slots
                 self.call_data.selected_timeslot = display_slots[0] if len(display_slots) == 1 else None
 
             def _format_slot(s):
-                st = s.get('Start') or s.get('start') or ''
-                en = s.get('End') or s.get('end') or ''
+                st = s.get('slotStart') or s.get('start') or s.get('Start') or ''
+                en = s.get('slotEnd') or s.get('end') or s.get('End') or ''
                 try:
                     d = datetime.fromisoformat(st.replace('Z', '+00:00'))
-                except:
+                except Exception:
                     d = datetime.strptime(st[:19], "%Y-%m-%dT%H:%M:%S")
                 try:
                     d2 = datetime.fromisoformat(en.replace('Z', '+00:00'))
-                except:
+                except Exception:
                     d2 = datetime.strptime(en[:19], "%Y-%m-%dT%H:%M:%S")
                 return d, d2
 
@@ -342,7 +357,7 @@ class BookingToolsMixin:
             }
 
         if self.call_data and self.call_data.collected_personnummer:
-            personnr = self.call_data.collected_personnummer
+            _ = self.call_data.collected_personnummer
         elif self.call_data:
             await self.samle_personnummer_med_dtmf(context)
             if not self.call_data.collected_personnummer:
@@ -350,7 +365,7 @@ class BookingToolsMixin:
                     "suksess": False,
                     "melding": self._get_text("personnummer_failed")
                 }
-            personnr = self.call_data.collected_personnummer
+            _ = self.call_data.collected_personnummer
 
         if self.call_data and not self.call_data.selected_treatment_id and self.clinic_treatments and kundeMelding:
             msg_lower = kundeMelding.lower()
@@ -450,7 +465,7 @@ class BookingToolsMixin:
             }
 
         if self.call_data and self.call_data.collected_personnummer:
-            personnr = self.call_data.collected_personnummer
+            _ = self.call_data.collected_personnummer
         elif self.call_data:
             await self.samle_personnummer_med_dtmf(context)
             if not self.call_data.collected_personnummer:
@@ -458,7 +473,7 @@ class BookingToolsMixin:
                     "suksess": False,
                     "melding": self._get_text("personnummer_failed")
                 }
-            personnr = self.call_data.collected_personnummer
+            _ = self.call_data.collected_personnummer
         
         update_task = None
 
@@ -519,28 +534,29 @@ class BookingToolsMixin:
     @function_tool()
     async def book_time(
         self, context: RunContext, 
-        personnr: str,
-        Fornavn: str, 
-        Etternavn: str,
-        mobilnr: str,
-        ClinicIDForValgtTime: str,
-        TreatmentIDForValgtTime: str,
-        ClinicianIDForValgtTime: str,        
-        StartTid: str,
-        SluttTid: str,
+        personnr: str = "",
+        Fornavn: str = "", 
+        Etternavn: str = "",
+        mobilnr: str = "",
+        ClinicIDForValgtTime: str = "",
+        TreatmentIDForValgtTime: str = "",
+        ClinicianIDForValgtTime: str = "",        
+        StartTid: str = "",
+        SluttTid: str = "",
         Dato: str = "",
         ):
-        """Brukes til å bestille en time for pasienten.
-        
-        IMPORTANT: Before calling this, you MUST have already collected:
-        1. Personnummer via samle_personnummer_med_dtmf() (collected BEFORE timeslot search)
-        2. Full name (Fornavn + Etternavn)
-        3. Email via samle_email()
-        4. Phone number (mobilnr)
-        NEVER call this without all four being collected first.
-        
-        Parameters:
-        - Dato: Appointment date (optional but recommended). Should be extracted from available_slots response (appointment_date field).
+        """Book an appointment for the patient.
+
+        For EXISTING patients (isExistingPatient=true from find-slot):
+          Only personnummer is needed. Name is auto-filled from the system.
+          Call this directly after the patient confirms the slot.
+
+        For NEW patients (isExistingPatient=false):
+          You MUST collect all of these BEFORE calling:
+          1. Personnummer via samle_personnummer_med_dtmf()
+          2. Full name (Fornavn + Etternavn)
+          3. Email via samle_email()
+          4. Phone number (mobilnr)
         """
         
         if self.call_data and self.call_data.collected_personnummer:
@@ -606,27 +622,45 @@ class BookingToolsMixin:
             
             if use_opus:
                 slot = self.call_data.selected_timeslot
-                clinic_id = slot.get('ClinicID') or slot.get('clinicId') or slot.get('clinic_id') or ClinicIDForValgtTime
-                clinician_id = slot.get('ClinicianID') or slot.get('clinicianId') or slot.get('clinician_id') or ClinicianIDForValgtTime
-                treatment_id = slot.get('TreatmentID') or slot.get('treatmentId') or slot.get('treatment_id') or TreatmentIDForValgtTime
-                start_time = slot.get('Start') or slot.get('start') or StartTid
-                end_time = slot.get('End') or slot.get('end') or SluttTid
-                
-                opus_result = await book_opus_appointment(
-                    business_id=self.call_data.business_id,
-                    clinic_id=clinic_id,
-                    treatment_id=treatment_id,
-                    clinician_id=clinician_id,
-                    start_time=start_time,
-                    end_time=end_time,
-                    personal_id_number=personnr,
-                    first_name=Fornavn,
-                    last_name=Etternavn,
-                    phone_number=mobilnr,
-                    email=self.call_data.collected_email if self.call_data else "",
-                    notes="Called via AI receptionist"
-                )
-                
+                clinician_id_val = slot.get('clinicianId') or slot.get('ClinicianID') or slot.get('clinician_id') or ClinicianIDForValgtTime
+                treatment_id_val = slot.get('treatmentId') or slot.get('TreatmentID') or slot.get('treatment_id') or TreatmentIDForValgtTime
+                slot_start = slot.get('slotStart') or slot.get('Start') or slot.get('start') or StartTid
+                slot_end = slot.get('slotEnd') or slot.get('End') or slot.get('end') or SluttTid
+
+                is_existing = slot.get('isExistingPatient', False)
+                patient_first = slot.get('patientFirstName', '') or Fornavn
+                patient_last = slot.get('patientLastName', '') or Etternavn
+                display_name = patient_first or Fornavn
+
+                opus_result = None
+
+                if is_existing:
+                    print("[OPUS FLOW] Existing patient detected — trying existing-patient/book")
+                    opus_result = await book_existing_patient(
+                        business_id=self.call_data.business_id,
+                        pid=personnr,
+                        treatment_id=int(treatment_id_val),
+                        clinician_id=int(clinician_id_val),
+                        slot_start=slot_start,
+                        slot_end=slot_end,
+                    )
+
+                if not opus_result or not opus_result.get("success"):
+                    if is_existing:
+                        print("[OPUS FLOW] existing-patient/book failed — falling back to new-patient/book")
+                    opus_result = await book_new_patient(
+                        business_id=self.call_data.business_id,
+                        pid=personnr,
+                        first_name=patient_first or Fornavn,
+                        last_name=patient_last or Etternavn,
+                        phone=mobilnr,
+                        email=self.call_data.collected_email if self.call_data else "",
+                        treatment_id=int(treatment_id_val),
+                        clinician_id=int(clinician_id_val),
+                        slot_start=slot_start,
+                        slot_end=slot_end,
+                    )
+
                 if opus_result.get("success"):
                     if self.call_data:
                         self.call_data.appointment_booked = True
@@ -637,12 +671,12 @@ class BookingToolsMixin:
                         c_title = clinician_info.get("title", "Tannlege")
                         if self._language_code() == "en":
                             title_en = "Dentist" if "tannlege" in c_title.lower() else c_title
-                            success_message = f"Your appointment is booked, {Fornavn}. Your dentist is {c_name} ({title_en})."
+                            success_message = f"Your appointment is booked, {display_name}. Your dentist is {c_name} ({title_en})."
                         else:
-                            success_message = f"Timen din er booket, {Fornavn}. Din tannlege er {c_name} ({c_title})."
+                            success_message = f"Timen din er booket, {display_name}. Din tannlege er {c_name} ({c_title})."
                     else:
                         success_template = self._get_text("booking_success") or "Time er nå booket for {name}."
-                        success_message = success_template.format(name=Fornavn)
+                        success_message = success_template.format(name=display_name)
 
                     return {
                         "suksess": True,

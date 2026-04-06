@@ -10,7 +10,7 @@ from core.call_data import CallData
 from core.language_texts import LANGUAGE_TEXTS
 from config.prompts import build_multilingual_instructions, build_business_prompt
 from OPUS_routes import (
-    get_clinicians, get_clinic_timeslots,
+    find_patient_slot,
     OPUS_PREFERRED_CLINICIAN_ID, OPUS_CLINIC_ID,
 )
 from tools.booking import BookingToolsMixin
@@ -552,80 +552,90 @@ class Assistant(
             return False
 
     async def _opus_find_timeslot(self, starting_from: Optional[str] = None) -> dict:
-        """Shared OPUS API logic: clinicians first -> then timeslots with clinic_id + clinician_id."""
+        """Shared OPUS API logic: find slot via POST /api/Opus/patient/find-slot."""
         lang = self._language_code()
         business_id = self.call_data.business_id if self.call_data else None
         treatment_id = self.call_data.selected_treatment_id if self.call_data else None
+        pid = self.call_data.collected_personnummer if self.call_data else ""
 
-        if not treatment_id and self.call_data and self.call_data.treatment_type_for_change and self.clinic_treatments:
+        treatment_name = None
+        if treatment_id and self.clinic_treatments:
+            for t in self.clinic_treatments:
+                if (t.get("ID") or t.get("id")) == treatment_id:
+                    treatment_name = t.get("Name") or t.get("name")
+                    break
+
+        if not treatment_name and self.call_data and self.call_data.treatment_type_for_change and self.clinic_treatments:
             name_hint = (self.call_data.treatment_type_for_change or "").strip().lower()
             for t in self.clinic_treatments:
                 t_name = (t.get("Name") or t.get("name") or "").lower()
                 t_desc = (t.get("Description") or t.get("description") or "").lower()
                 if name_hint in t_name or name_hint in t_desc or "recall" in t_name or "recall" in t_desc:
+                    treatment_name = t.get("Name") or t.get("name")
                     treatment_id = t.get("ID") or t.get("id")
                     if treatment_id and self.call_data:
                         self.call_data.selected_treatment_id = treatment_id
                     break
 
-        print(f"[OPUS FLOW] _opus_find_timeslot called: business_id={business_id}, treatment_id={treatment_id}, clinic_id={OPUS_CLINIC_ID}, starting_from={starting_from}")
+        print(f"[OPUS FLOW] _opus_find_timeslot called: business_id={business_id}, treatment_name={treatment_name}, pid={'***' if pid else 'MISSING'}, starting_from={starting_from}")
 
-        if not business_id or not treatment_id:
-            print(f"[OPUS FLOW] Abort: missing business_id or treatment_id (business_id={bool(business_id)}, treatment_id={treatment_id})")
+        if not business_id or not treatment_name:
+            print(f"[OPUS FLOW] Abort: missing business_id or treatment_name")
             return {
                 "suksess": False,
                 "melding": "Unable to check availability." if lang == "en" else "Kan ikke sjekke tilgjengelighet for øyeblikket."
             }
 
-        clinic_id = OPUS_CLINIC_ID
+        if not pid:
+            print("[OPUS FLOW] Abort: missing personnummer (pid)")
+            return {
+                "suksess": False,
+                "melding": "Personal ID number is required to check availability. Please collect it first." if lang == "en" else "Personnummer er påkrevd for å sjekke tilgjengelighet. Vennligst samle det inn først."
+            }
 
         try:
-            print("[OPUS FLOW] Step 1: Calling get_clinicians API...")
-            clinicians = await get_clinicians(business_id, clinic_id, treatment_id)
-            preferred_clinician = next(
-                (c for c in clinicians if c.get('id') == OPUS_PREFERRED_CLINICIAN_ID and c.get('active', False)),
-                None
-            )
+            print("[OPUS FLOW] Calling find_patient_slot API...")
+            slots = await find_patient_slot(business_id, pid, treatment_name, starting_from)
 
-            if not preferred_clinician:
-                print(f"[TOOL] Preferred clinician {OPUS_PREFERRED_CLINICIAN_ID} not found for treatment {treatment_id}")
-                if lang == "en":
-                    return {"suksess": False, "melding": "Sorry, the dentist is not available for this treatment at the moment. Would you like to try another treatment or date?"}
-                return {"suksess": False, "melding": "Beklager, tannlegen er ikke tilgjengelig for denne behandlingen for øyeblikket. Vil du prøve en annen behandling eller dato?"}
+            found_slots = [s for s in slots if s.get("found")]
 
-            print("[OPUS FLOW] Step 2: Calling get_clinic_timeslots API...")
-            timeslots = await get_clinic_timeslots(
-                business_id, treatment_id,
-                starting_from=starting_from,
-                clinic_id=clinic_id,
-                clinician_id=OPUS_PREFERRED_CLINICIAN_ID
-            )
-
-            if not timeslots:
+            if not found_slots:
+                not_found_reason = next((s.get("reason") for s in slots if not s.get("found") and s.get("reason")), None)
+                print(f"[OPUS FLOW] No available slots. Reason: {not_found_reason}")
                 if lang == "en":
                     return {"suksess": False, "melding": "Sorry, the dentist has no available appointments right now. Would you like to check another date?"}
                 return {"suksess": False, "melding": "Beklager, tannlegen har ingen ledige timer akkurat nå. Vil du prøve en annen dato?"}
 
-            clinician_name = preferred_clinician.get("name", "")
-            clinician_title = preferred_clinician.get("title", "Tannlege")
+            first_slot = found_slots[0]
+            clinician_name = first_slot.get("clinicianName", "")
+            clinician_id = first_slot.get("clinicianId")
+            clinician_title = "Tannlege"
+
+            if self.call_data:
+                if first_slot.get("patientFirstName"):
+                    self.call_data.customer_first_name = first_slot["patientFirstName"]
+                if first_slot.get("patientLastName"):
+                    self.call_data.customer_last_name = first_slot["patientLastName"]
+                if first_slot.get("treatmentId"):
+                    self.call_data.selected_treatment_id = first_slot["treatmentId"]
 
             if self.call_data:
                 self.call_data.selected_clinician = {
-                    "id": preferred_clinician.get("id"),
+                    "id": clinician_id,
                     "name": clinician_name,
                     "title": clinician_title,
                 }
 
-            max_slots = min(len(timeslots), 5)
-            display_slots = timeslots[:max_slots]
+            max_slots = min(len(found_slots), 5)
+            display_slots = found_slots[:max_slots]
 
             if self.call_data:
                 self.call_data.available_timeslots = display_slots
                 self.call_data.selected_timeslot = display_slots[0] if len(display_slots) == 1 else None
 
             def _fmt(s):
-                st = s.get('Start') or s.get('start') or ''
-                en = s.get('End') or s.get('end') or ''
+                st = s.get('slotStart') or s.get('start') or s.get('Start') or ''
+                en = s.get('slotEnd') or s.get('end') or s.get('End') or ''
                 try:
                     d = datetime.fromisoformat(st.replace('Z', '+00:00'))
                 except:

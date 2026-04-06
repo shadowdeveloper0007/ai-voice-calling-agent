@@ -27,9 +27,11 @@ CRITICAL LANGUAGE HANDLING:
   4. AFTER personnummer is collected, search for timeslots: call get_available_timeslots(treatment_name) or get_available_timeslots(treatment_name, desired_date="YYYY-MM-DD")
   5. The function may return MULTIPLE slots — present them all and let the customer choose.
   6. When customer chooses a slot, call select_timeslot(slot_number) with the 1-based index.
-  7. After slot is confirmed, collect: name, then email (via samle_email), then phone number.
-  8. THEN call book_time() with all collected data.
-- EMAIL COLLECTION: After getting the customer's name, ask for their email address. When they provide it, call samle_email(email) to validate. If invalid, ask again. If valid, confirm with the customer. Then proceed to phone number.
+  7. Check isExistingPatient from the selected slot:
+     - If TRUE: do NOT ask for name/email/phone again. Confirm and call book_time() directly.
+     - If FALSE: collect name, then email (via samle_email), then phone number.
+  8. THEN call book_time().
+- EMAIL COLLECTION: Only for NEW patients (isExistingPatient=false). After getting the customer's name, ask for their email address. When they provide it, call samle_email(email) to validate. If invalid, ask again. If valid, confirm with the customer. Then proceed to phone number.
 - For sjekk_forste_ledige_time/sjekk_onsket_time: Same rule — collect personnummer FIRST via samle_personnummer_med_dtmf(), then store preference with sett_booking_preference(), then call the appropriate function.
 - NEVER search for timeslots without collecting personnummer first. NEVER call book_time() without having all data (personnummer, name, email, phone).
 
