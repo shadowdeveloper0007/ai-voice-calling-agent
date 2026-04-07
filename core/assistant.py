@@ -8,7 +8,11 @@ from livekit.agents import Agent, RunContext
 
 from core.call_data import CallData
 from core.language_texts import LANGUAGE_TEXTS
-from config.prompts import build_multilingual_instructions, build_business_prompt
+from config.prompts import (
+    build_multilingual_instructions,
+    build_business_prompt,
+    format_clinic_treatments_catalog,
+)
 from OPUS_routes import (
     find_patient_slot,
     OPUS_PREFERRED_CLINICIAN_ID, OPUS_CLINIC_ID,
@@ -68,8 +72,11 @@ class Assistant(
         
         day_name_with_date = f"{day_name} {date_str}"
         time_str_with_label = f"{time_str} (lokal tid)"
-        
-        multilingual_instructions = build_multilingual_instructions()
+
+        treatment_catalog = format_clinic_treatments_catalog(clinic_treatments or [])
+        multilingual_instructions = build_multilingual_instructions(
+            treatment_catalog=treatment_catalog
+        )
         
         conversation_history_text = ""
         

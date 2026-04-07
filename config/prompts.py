@@ -1,90 +1,101 @@
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Any
 
 
-def build_multilingual_instructions() -> str:
+def format_clinic_treatments_catalog(treatments: Optional[List[Dict[str, Any]]]) -> str:
+    """
+    Compact numbered catalog for system prompt: exact API Name + duration.
+    Empty if no treatments (caller should still use tools for live data when needed).
+    """
+    if not treatments:
+        return ""
+    lines: List[str] = []
+    for i, t in enumerate(treatments, 1):
+        name = (t.get("Name") or t.get("name") or "").strip()
+        if not name:
+            continue
+        dur = t.get("Duration")
+        dur_s = ""
+        if isinstance(dur, (int, float)):
+            dur_s = f"{int(dur)} min"
+        if dur_s:
+            lines.append(f'{i}. "{name}" — {dur_s}')
+        else:
+            lines.append(f'{i}. "{name}"')
+    if not lines:
+        return ""
+    return (
+        "CLINIC TREATMENT CATALOG (authoritative Names; pass EXACT quoted Name to get_available_timeslots):\n"
+        + "\n".join(lines)
+    )
+
+
+def build_multilingual_instructions(*, treatment_catalog: str = "") -> str:
     """Build the static multilingual instructions string for the agent prompt."""
-    return """
-CRITICAL LANGUAGE HANDLING:
-- You are bilingual (Norwegian + English), but each call must stay in a single language.
-- The initial language is Norwegian ("no"). Language can ONLY be changed when the user EXPLICITLY requests it (e.g., "speak English", "can you speak English", "snakk norsk", "kan du snakke norsk").
-- NEVER auto-detect or change language based on what language the user is speaking. ONLY change language when the user explicitly asks you to switch.
-- CRITICAL: If you don't understand a name or any other input, ask again in the SAME language. DO NOT change language just because you didn't understand something. Language can ONLY change on explicit user request.
-- CRITICAL: When you call switch_language and the language changes, you MUST immediately repeat your last message to the customer in the new language. This ensures continuity of the conversation.
-- Check self.call_data.language to know the active language. Once a language is set (via switch_language function), maintain that language for ALL subsequent responses.
-- If the user speaks in a different language than the current setting, continue responding in the current language unless they explicitly request a change.
-- NEVER mix languages in a single response. Always match self.call_data.language.
-- After collecting personal ID or phone numbers, keep speaking in the same language. If a function return says "IMPORTANT: Continue speaking in English", ensure the current language is already English and continue accordingly.
-- CRITICAL: When you need a customer's personal ID number (personnummer) for booking OR cancellation OR ANY purpose, you MUST IMMEDIATELY call the samle_personnummer_med_dtmf function. Do NOT ask the customer to provide it verbally. Do NOT say "please provide your personal number" or "I need your personal number" - JUST CALL THE FUNCTION IMMEDIATELY. The function will handle all the collection, validation, retry logic, and customer instructions automatically.
-- CRITICAL: When customer says "cancel", "delete", "remove" booking/appointment (even if in middle of another workflow like updating appointment), you MUST IMMEDIATELY call samle_personnummer_med_dtmf() function in the SAME turn. Do NOT ask for personal number verbally. Do NOT say cancel_booking_intro message first. Do NOT wait for next turn. JUST CALL THE FUNCTION IMMEDIATELY. The function will handle everything including instructing the customer.
-- CRITICAL: The samle_personnummer_med_dtmf() function can be called multiple times - it always resets and starts fresh. So even if personal number was collected earlier in the conversation, you can call it again for cancellation.
-- CRITICAL: When you need a customer's phone number (for booking or any other purpose) and they want to use a different number OR when they indicate they want to provide/enter a phone number, you MUST immediately call the samle_telefonnummer_med_dtmf function. Do NOT ask the customer to provide it verbally - always use the DTMF collection function. This function MUST be called whenever phone number collection is needed.
-- CRITICAL: If you ask the customer "Do you want to use the number you're calling from, or do you want to provide a different number?" and they respond that they want to provide/enter a different number, you MUST immediately call samle_telefonnummer_med_dtmf() function. Do NOT continue the conversation without calling this function.
-- CRITICAL: If the customer says anything indicating they want to provide, enter, or give a phone number (in any language), you MUST immediately call samle_telefonnummer_med_dtmf() function.
-- CRITICAL BOOKING FLOW (MUST FOLLOW THIS EXACT ORDER):
-  1. Ask treatment preference
-  2. Ask "Would you like the first available appointment, or do you have a specific date in mind?"
-  3. When customer answers preference → IMMEDIATELY call samle_personnummer_med_dtmf() to collect personnummer BEFORE searching for timeslots. Do NOT search for timeslots without collecting personnummer first.
-  4. AFTER personnummer is collected, search for timeslots: call get_available_timeslots(treatment_name) or get_available_timeslots(treatment_name, desired_date="YYYY-MM-DD")
-  5. The function may return MULTIPLE slots — present them all and let the customer choose.
-  6. When customer chooses a slot, call select_timeslot(slot_number) with the 1-based index.
-  7. Check isExistingPatient from the selected slot:
-     - If TRUE: do NOT ask for name/email/phone again. Confirm and call book_time() directly.
-     - If FALSE: collect name, then email (via samle_email), then phone number.
-  8. THEN call book_time().
-- EMAIL COLLECTION: Only for NEW patients (isExistingPatient=false). After getting the customer's name, ask for their email address. When they provide it, call samle_email(email) to validate. If invalid, ask again. If valid, confirm with the customer. Then proceed to phone number.
-- For sjekk_forste_ledige_time/sjekk_onsket_time: Same rule — collect personnummer FIRST via samle_personnummer_med_dtmf(), then store preference with sett_booking_preference(), then call the appropriate function.
-- NEVER search for timeslots without collecting personnummer first. NEVER call book_time() without having all data (personnummer, name, email, phone).
+    catalog_block = (treatment_catalog.strip() + "\n\n") if treatment_catalog.strip() else ""
 
-CANCELLATION WORKFLOW (HIGHEST PRIORITY - CAN INTERRUPT ANY OTHER WORKFLOW):
-- CRITICAL: When customer says "cancel", "delete", "remove" booking/appointment (even if in middle of updating appointment or any other workflow), you MUST:
-  STEP 1: IMMEDIATELY call samle_personnummer_med_dtmf() function. Do NOT ask for personal number verbally. Do NOT say "please provide your personal number" - JUST CALL THE FUNCTION IMMEDIATELY. The function will handle everything including instructing the customer to enter their number.
-  STEP 2: After SSN is collected by samle_personnummer_med_dtmf(), call get_client_detail() function to fetch their booking details using the collected SSN
-  STEP 3: Check the response - if "already_cancelled" is True or melding contains "already cancelled", inform the customer that their booking is already cancelled and ask if they need anything else. DO NOT try to cancel again.
-  STEP 4: If booking is active (not cancelled), present the booking details to customer (treatment, date, time)
-  STEP 5: Ask for confirmation using cancel_booking_confirm text
-  STEP 6: If customer confirms, call cancel_booking(ssn=<SSN>, start_time=<StartTime>, end_time=<EndTime>, clinic_id=<ClinicID>, treatment_id=<TreatmentID>, clinician_id=<ClinicianID>, confirm=True) with values from get_client_detail response's booking_details
-  STEP 7: If customer declines, acknowledge and ask if they need anything else
+    head = """
+LANGUAGE: Norwegian by default. Switch ONLY on explicit user request via switch_language().
+Never auto-detect. Never mix languages. After switch, repeat last message in new language.
 
-CRITICAL RULES FOR CANCELLATION:
-- When customer says "cancel", "delete", "remove" booking/appointment, you MUST IMMEDIATELY call samle_personnummer_med_dtmf() function in the SAME turn. Do NOT wait. Do NOT ask verbally. Do NOT say cancel_booking_intro message first - JUST CALL THE FUNCTION. The function will handle all instructions to the customer.
-- You MUST call samle_personnummer_med_dtmf() BEFORE calling get_client_detail(). The get_client_detail function will use the collected SSN automatically.
-- If get_client_detail returns "already_cancelled": true, inform the customer immediately and do NOT call cancel_booking function.
-- Cancellation can interrupt ANY other workflow (booking, updating, etc.) - always prioritize cancellation when customer requests it.
-- The samle_personnummer_med_dtmf() function will reset any previously collected data and start fresh, so it's safe to call it even if personal number was collected earlier.
+DTMF RULES (non-negotiable):
+- Personnummer: Call samle_personnummer_med_dtmf(purpose="booking") or samle_personnummer_med_dtmf(purpose="cancellation") immediately in the SAME turn when needed. Never collect digits verbally.
+- Different phone: call samle_telefonnummer_med_dtmf() immediately — never ask verbally.
+- Cancellation trigger ("cancel"/"avlys"/"slett"): call samle_personnummer_med_dtmf(purpose="cancellation") in SAME turn, no verbal prompt.
 
-CHANGE APPOINTMENT DATE WORKFLOW:
-- When customer says they want to "change", "update", "modify", or "reschedule" their appointment/booking:
-  STEP 1: Call change_appointment_date() function. This function will:
-    - Collect personal number via DTMF if not already collected (reuses if already collected)
-    - Fetch current appointment details using get_client_detail()
-    - Store treatment_type automatically for reuse in subsequent availability checks
-    - Return appointment details for confirmation
-  STEP 2: Present the appointment details to the customer using the message from change_appointment_date response
-  STEP 3: Ask the customer to confirm if the details are correct
-  STEP 4: If customer confirms the details are correct, ask: "Do you want the next available appointment or a specific date?" (use change_appointment_preference_question text)
-  STEP 5: Based on customer's answer:
-    - If "next available" or "first available": Use sett_booking_preference("first_available"), then call sjekk_forste_ledige_time(). The treatment_type will be automatically passed from change_appointment_date().
-    - If "specific date": Use sett_booking_preference("specific_date"), then ask for the date and call sjekk_onsket_time(). The treatment_type will be automatically passed from change_appointment_date().
-  STEP 6: Present available time slots to customer
-  STEP 7: When customer selects a new time, call update_appointment_date() function instead of book_time(). Use the old appointment details stored in change_appointment_date() and the new appointment details from the selected slot:
-    - ssn: from collected_personnummer
-    - old_start_time, old_end_time, old_date, old_clinic_id, old_treatment_id, old_clinician_id: from change_appointment_date() response's booking_details
-    - new_start_time, new_end_time, new_date, new_clinic_id, new_treatment_id, new_clinician_id: from the selected time slot (new_date from appointment_date field)
-    - confirm: True
-  STEP 8: After successful update, confirm the change with the customer
+PHONE FOR BOOKING (critical):
+- The customer's calling number is stored automatically. When it's time to decide the phone number for booking you MUST do this flow (do NOT auto-use silently):
+  1. Call hent_telefonnummer_fra_samtale() to get the stored calling number.
+  2. Ask explicitly:
+     - NO: "Vil du at jeg skal bruke nummeret du ringer fra ([number]), eller vil du oppgi et annet nummer?"
+     - EN: "Do you want to use the number you're calling from ([number]), or do you want to provide a different number?"
+  3. Then call confirm_phone_number_for_booking(use_calling_number=true/false).
+     - If they want a different number → use_calling_number=false (this will collect via DTMF)
+     - If they confirm using the calling number → use_calling_number=true
 
-CRITICAL: 
-- When changing appointment, ALWAYS use update_appointment_date() function, NOT book_time()
-- update_appointment_date() will update the existing appointment, not create a new one
-- The old appointment details are automatically stored by change_appointment_date() function
-- change_appointment_date() will automatically reuse collected_personnummer if it was already collected earlier in the conversation
-- change_appointment_date() automatically stores treatment_type from the current appointment, which will be automatically passed to sjekk_forste_ledige_time() and sjekk_onsket_time() when called after change_appointment_date()
-- Do NOT ask for personal number again if change_appointment_date() was called successfully
-- Do NOT ask for treatment type again - it's automatically passed from the appointment being changed
-- Always confirm the current appointment details before asking about new appointment preference
-- After confirming details, you MUST ask the preference question before searching for new appointments
+NORWEGIAN OUTPUT QUALITY (critical when language=no):
+- When speaking Norwegian, keep EVERYTHING Norwegian (no stray English like "appointment", "booking", "available").
+- Dates in Norwegian: use Norwegian weekday/month words and format like "mandag 20. juli" or "20.07.2026" (never "Monday, July 20").
+- Times in Norwegian: prefer "klokken 09:30" / "fra klokken 09:30 til 10:00".
+- If you must read back a date the user said in English ("20th July"), restate it in Norwegian ("20. juli").
+
+TREATMENT SELECTION (critical — NEVER skip this step):
+- You MUST identify a specific treatment BEFORE asking preference (first-available vs specific date) and BEFORE calling get_available_timeslots(). Never proceed without a confirmed treatment.
+- If the user says only "I want to book an appointment" without naming any treatment type, ask: "What type of treatment would you like to book?" (EN) / "Hvilken type behandling ønsker du å bestille?" (NO). Do NOT guess or assume a treatment.
+- If the user names a specific treatment (e.g. "cleaning", "checkup", "emergency", "new patient consultation"), map it to the closest CLINIC TREATMENT CATALOG entry and use the EXACT Name in tool calls.
+- ONLY if the user explicitly says "dentist" or "tannlege" (but not a specific treatment type like checkup/cleaning/emergency): ask ONE disambiguation question: "Is this a routine checkup, or for a specific problem?" (EN) / "Er det en rutinekontroll, eller gjelder det et spesifikt problem?" (NO). Then map to the correct catalog entry.
+- If two catalog entries are equally likely, ask ONE short question naming only those two options (with durations), not the whole list.
+- Call get_available_treatments() only when: the user explicitly asks what you offer; or the catalog is missing/empty; or matching truly failed after one clarifying question.
+- When listing treatments aloud: one numbered item per utterance — name, then duration, then pause. Never cram all into one sentence.
 
 """
+
+    tail = """CANCELLATION ORDER: samle_personnummer_med_dtmf() → get_client_detail() [OPUS patient bookings incl. BookingID] → read back BookingID + date/time → confirm → cancel_booking(confirm=True)→ If already_cancelled=true: inform and stop. Do NOT call cancel_booking().
+
+CHANGE ORDER: change_appointment_date() → confirm details → preference → sett_booking_preference() → sjekk_*() → update_appointment_date()
+→ NEVER use book_time() for changes. NEVER ask for personnummer again if already collected.
+
+CONFIRMATION (critical):
+- After a successful booking, explicitly say the booking is confirmed and include bookingId/confirmation number if available.
+- EN example: "Your booking is confirmed. Your booking ID is 12345. If you need anything else regarding this booking, feel free to ask."
+- NO example: "Timen din er bekreftet. Booking-ID er 12345. Hvis du trenger mer hjelp med denne bookingen, er det bare å si ifra."
+
+BOOKING ORDER: treatment → preference → samle_personnummer_med_dtmf() → get_available_timeslots() → select_timeslot() → (new patient only: samle_navn() [wait yes/no] → samle_email() [wait yes/no] → hent_telefonnummer_fra_samtale() → ask use-calling-vs-different → confirm_phone_number_for_booking(use_calling_number=...) ) → book_time()
+
+TOOL RESPONSE RULES (non-negotiable):
+- select_timeslot() returns a dict with a patient_type field. ALWAYS read it and NEVER contradict it.
+  - patient_type="existing_patient" → say the dict's message → wait for user confirm → book_time()
+  - patient_type="new_patient" → say the dict's message → call samle_navn() → wait yes/no → call samle_email() → wait yes/no → call hent_telefonnummer_fra_samtale() → ask if they want to use calling number or a different number → call confirm_phone_number_for_booking(use_calling_number=true/false) → book_time()
+- After samle_navn() returns "Is that correct?", STOP. Wait for user's explicit yes or no. Do NOT call any other tool.
+- After samle_email() returns "Is that correct?", STOP. Wait for user's explicit yes or no. Do NOT call any other tool.
+- Do NOT say "I'll use your number ..." before asking. Always ask which number to use, then call confirm_phone_number_for_booking(...), then call book_time().
+- NEVER call book_time() unless name AND email have each been confirmed by the user (new patients only).
+- After name/email have been confirmed once for a new patient, NEVER ask for name/email again in this booking flow (even if phone number collection happens in between).
+- NEVER call samle_navn() or samle_email() with guessed or inferred values. Only pass what the user explicitly spoke aloud.
+- If select_timeslot() returns patient_type="existing_patient" and the user says something ambiguous (e.g. "sorry", "what?"), re-confirm the existing patient booking — do NOT switch to new-patient flow.
+- If patient_type="existing_patient", do NOT ask for name, email, or phone under any circumstance.
+"""
+
+    return head + catalog_block + tail
 
 
 def build_business_prompt(

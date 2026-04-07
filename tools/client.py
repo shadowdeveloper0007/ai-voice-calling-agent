@@ -4,11 +4,19 @@ import random
 
 from livekit.agents import function_tool, RunContext
 
-from config.constants import GET_CLIENT_DETAIL_URL, CANCEL_BOOKING_URL, UPDATE_APPOINTMENT_URL
+from config.constants import UPDATE_APPOINTMENT_URL
+from OPUS_routes import get_patient_bookings, cancel_booking_opus
 
 
 class ClientToolsMixin:
     """Mixin containing client management tools (get details, cancel, change, update)."""
+
+    def _speak_booking_id(self, booking_id: str) -> str:
+        """Format booking id for TTS (e.g. '124426' -> '1 2 4 4 2 6')."""
+        s = "".join(ch for ch in str(booking_id) if ch.isdigit())
+        if not s:
+            return ""
+        return " ".join(list(s))
 
     @function_tool()
     async def get_client_detail(
@@ -26,7 +34,7 @@ class ClientToolsMixin:
         if self.call_data and self.call_data.collected_personnummer:
             personnr = self.call_data.collected_personnummer
         elif self.call_data:
-            await self.samle_personnummer_med_dtmf(context)
+            await self.samle_personnummer_med_dtmf(context, purpose="cancellation")
             if not self.call_data.collected_personnummer:
                 return {
                     "suksess": False,
@@ -81,152 +89,148 @@ class ClientToolsMixin:
                 allow_interruptions=False
             )
             await context.wait_for_playout()
-            
-            webhook_url = GET_CLIENT_DETAIL_URL
-            
-            data = {
-                "ssn": personnr
-            }
-            data.update(self.booking_config)
-            
-            print(f"[WEBHOOK] GET {webhook_url}")
-            print(f"[WEBHOOK PAYLOAD] {json.dumps(data, indent=2, ensure_ascii=False)}")
-            
-            webhook_response = await self._call_webhook_with_retry('GET', webhook_url, data)
-            
-            if webhook_response is None:
+
+            if not self.call_data or not self.call_data.business_id:
                 return {
                     "suksess": False,
-                    "melding": self._technical_error_message("get_client_detail")
+                    "melding": self._technical_error_message("get_client_detail") or ("Missing business_id" if self._language_code() == "en" else "Mangler business_id"),
                 }
-            
-            response_status = webhook_response['status']
-            response_text = webhook_response['text']
-            result = webhook_response['json'] if webhook_response['json'] is not None else response_text
-            
-            print(f"[WEBHOOK RESPONSE] Status: {response_status}")
-            print(f"[WEBHOOK RESPONSE] Body: {json.dumps(result, indent=2, ensure_ascii=False) if isinstance(result, dict) else response_text}")
-            
-            if response_status == 200:
-                if isinstance(result, dict):
-                    if result.get("suksess", False):
-                        response_data = result.get("data", {})
-                        bookings = response_data.get("bookings", [])
-                        
-                        if bookings and len(bookings) > 0:
-                            booking = bookings[0]
-                            
-                            treatment = booking.get("treatment_type", booking.get("treatment_id", "behandling"))
-                            date = booking.get("date", "")
-                            start_time = booking.get("start_time", "")
-                            end_time = booking.get("end_time", "")
-                            status = booking.get("status", "").lower()
-                            
-                            cancelled_bookings = response_data.get("cancelled_bookings", 0)
-                            is_cancelled = (status == "cancelled" or cancelled_bookings > 0)
-                            
-                            date_text = self._format_date_for_language(date) if date else date
-                            time_text = self._format_time_for_language(start_time) if start_time else start_time
-                            
-                            if is_cancelled:
-                                cancelled_template = self._get_text("booking_already_cancelled")
-                                if not cancelled_template:
-                                    cancelled_template = "Du har allerede avlyst timen for {treatment} den {date} klokken {time}." if self._language_code() == "no" else "You have already cancelled the appointment for {treatment} on {date} at {time}."
-                                
-                                cancellation_message = result.get("melding", "")
-                                if cancellation_message:
-                                    cancelled_message = cancellation_message
-                                else:
-                                    cancelled_message = cancelled_template.format(
-                                        treatment=treatment,
-                                        date=date_text or date,
-                                        time=time_text or start_time
-                                    )
-                                
-                                return {
-                                    "suksess": True,
-                                    "data": booking,
-                                    "melding": cancelled_message,
-                                    "already_cancelled": True,
-                                    "booking_details": {
-                                        "treatment": treatment,
-                                        "date": date,
-                                        "time": start_time,
-                                        "StartTime": start_time,
-                                        "EndTime": end_time,
-                                        "ClinicID": str(booking.get("clinic_id", "")),
-                                        "TreatmentID": str(booking.get("treatment_id", "")),
-                                        "ClinicianID": str(booking.get("clinician_id", "")),
-                                        "FirstName": booking.get("first_name", ""),
-                                        "LastName": booking.get("last_name", ""),
-                                        "PhoneNumber": str(booking.get("phone_number", "")),
-                                        "SSN": personnr,
-                                        "Status": status
-                                    }
-                                }
-                            else:
-                                success_template = self._get_text("client_detail_found")
-                                if not success_template:
-                                    success_template = "Perfekt! Jeg fant bookingen din. Du har en time for {treatment} den {date} klokken {time}." if self._language_code() == "no" else "Perfect! I found your booking. You have an appointment for {treatment} on {date} at {time}."
-                                success_message = success_template.format(
-                                    treatment=treatment,
-                                    date=date_text or date,
-                                    time=time_text or start_time
-                                )
-                                
-                                return {
-                                    "suksess": True,
-                                    "data": booking,
-                                    "melding": success_message,
-                                    "already_cancelled": False,
-                                    "booking_details": {
-                                        "treatment": treatment,
-                                        "date": date,
-                                        "time": start_time,
-                                        "StartTime": start_time,
-                                        "EndTime": end_time,
-                                        "ClinicID": str(booking.get("clinic_id", "")),
-                                        "TreatmentID": str(booking.get("treatment_id", "")),
-                                        "ClinicianID": str(booking.get("clinician_id", "")),
-                                        "FirstName": booking.get("first_name", ""),
-                                        "LastName": booking.get("last_name", ""),
-                                        "PhoneNumber": str(booking.get("phone_number", "")),
-                                        "SSN": personnr,
-                                        "Status": status
-                                    }
-                                }
-                        else:
-                            not_found_text = self._get_text("client_detail_not_found")
-                            if not not_found_text:
-                                not_found_text = "Jeg fant ingen booking for dette personnummeret. Kan du bekrefte at personnummeret er korrekt?" if self._language_code() == "no" else "I couldn't find any booking for this personal number. Can you confirm the personal number is correct?"
-                            return {
-                                "suksess": False,
-                                "melding": not_found_text
-                            }
-                    else:
-                                    not_found_text = self._get_text("client_detail_not_found")
-                                    if not not_found_text:
-                                        not_found_text = "Jeg fant ingen booking for dette personnummeret. Kan du bekrefte at personnummeret er korrekt?" if self._language_code() == "no" else "I couldn't find any booking for this personal number. Can you confirm the personal number is correct?"
-                                    return {
-                                        "suksess": False,
-                                        "melding": not_found_text
-                                    }
-                else:
-                    not_found_text = self._get_text("client_detail_not_found")
-                    if not not_found_text:
-                        not_found_text = "Jeg fant ingen booking for dette personnummeret. Kan du bekrefte at personnummeret er korrekt?" if self._language_code() == "no" else "I couldn't find any booking for this personal number. Can you confirm the personal number is correct?"
-                    return {
-                        "suksess": False,
-                        "melding": not_found_text
-                    }
-            else:
+
+            bookings = await get_patient_bookings(
+                business_id=self.call_data.business_id,
+                pid=personnr,
+            )
+
+            if not bookings:
                 not_found_text = self._get_text("client_detail_not_found")
                 if not not_found_text:
-                    not_found_text = "Jeg fant ingen booking for dette personnummeret. Kan du bekrefte at personnummeret er korrekt?" if self._language_code() == "no" else "I couldn't find any booking for this personal number. Can you confirm the personal number is correct?"
-                return {
-                    "suksess": False,
-                    "melding": not_found_text
+                    not_found_text = "Jeg fant ingen aktiv booking for dette personnummeret." if self._language_code() == "no" else "I couldn't find any active booking for this personal number."
+                return {"suksess": False, "melding": not_found_text}
+
+            def _is_cancelled(b: dict) -> bool:
+                status = (b.get("status") or b.get("Status") or "").lower()
+                return status in {"cancelled", "canceled", "avlyst"} or b.get("alreadyCancelled") is True or b.get("already_cancelled") is True
+
+            booking = next((b for b in bookings if not _is_cancelled(b)), bookings[0])
+            status = (booking.get("status") or booking.get("Status") or "").lower()
+            is_cancelled = _is_cancelled(booking)
+
+            # OPUS bookings response shape (expected):
+            # {
+            #   "ID": 124426,
+            #   "Patient": {...},
+            #   "TimeSlot": {"Start": "...", "End": "...", "ClinicID": "...", "ClinicianID": 8692, "TreatmentID": 52292},
+            #   "FreeTextMessage": "...",
+            # }
+            booking_id = str(
+                booking.get("bookingId")
+                or booking.get("BookingID")
+                or booking.get("id")
+                or booking.get("ID")
+                or ""
+            )
+
+            patient = booking.get("Patient") if isinstance(booking.get("Patient"), dict) else {}
+            timeslot = booking.get("TimeSlot") if isinstance(booking.get("TimeSlot"), dict) else {}
+
+            start_time = (
+                timeslot.get("Start")
+                or booking.get("startTime")
+                or booking.get("StartTime")
+                or booking.get("slotStart")
+                or booking.get("start")
+                or booking.get("start_time")
+                or ""
+            )
+            end_time = (
+                timeslot.get("End")
+                or booking.get("endTime")
+                or booking.get("EndTime")
+                or booking.get("slotEnd")
+                or booking.get("end")
+                or booking.get("end_time")
+                or ""
+            )
+            date = booking.get("date") or booking.get("Date") or (start_time[:10] if isinstance(start_time, str) and len(start_time) >= 10 else "")
+
+            # Treatment name is not included in this OPUS response; keep stable fallback for speech.
+            treatment = booking.get("treatmentName") or booking.get("treatment") or booking.get("treatment_type") or "behandling"
+
+            date_text = self._format_date_for_language(date) if date else date
+            time_text = self._format_time_for_language(start_time) if start_time else start_time
+
+            if is_cancelled:
+                cancelled_template = self._get_text("booking_already_cancelled")
+                if not cancelled_template:
+                    cancelled_template = "Du har allerede avlyst timen for {treatment} den {date} klokken {time}." if self._language_code() == "no" else "You have already cancelled the appointment for {treatment} on {date} at {time}."
+                cancelled_message = cancelled_template.format(treatment=treatment, date=date_text or date, time=time_text or start_time)
+                details = {
+                    "BookingID": booking_id,
+                    "treatment": treatment,
+                    "date": date,
+                    "time": start_time,
+                    "StartTime": start_time,
+                    "EndTime": end_time,
+                    "ClinicID": str(timeslot.get("ClinicID") or booking.get("clinicId") or booking.get("ClinicID") or booking.get("clinic_id") or ""),
+                    "TreatmentID": str(timeslot.get("TreatmentID") or booking.get("treatmentId") or booking.get("TreatmentID") or booking.get("treatment_id") or ""),
+                    "ClinicianID": str(timeslot.get("ClinicianID") or booking.get("clinicianId") or booking.get("ClinicianID") or booking.get("clinician_id") or ""),
+                    "FirstName": patient.get("FirstName") or booking.get("firstName") or booking.get("FirstName") or booking.get("first_name") or "",
+                    "LastName": patient.get("LastName") or booking.get("lastName") or booking.get("LastName") or booking.get("last_name") or "",
+                    "PhoneNumber": str(patient.get("MobilePhoneNumber") or booking.get("mobilePhoneNumber") or booking.get("PhoneNumber") or booking.get("phone_number") or ""),
+                    "SSN": patient.get("PatientPersonalIdentification") or personnr,
+                    "Status": status,
                 }
+                if self.call_data:
+                    self.call_data.old_appointment_details = details
+
+                return {
+                    "suksess": True,
+                    "data": booking,
+                    "melding": cancelled_message,
+                    "already_cancelled": True,
+                    "booking_details": details,
+                }
+
+            success_template = self._get_text("client_detail_found")
+            if not success_template:
+                if self._language_code() == "en":
+                    success_template = "Perfect! I found your booking ID {booking_id_spoken}. You have an appointment for {treatment} on {date} at {time}."
+                else:
+                    success_template = "Perfekt! Jeg fant bookingen din. Booking-ID er {booking_id}. Du har en time for {treatment} den {date} klokken {time}."
+
+            success_message = success_template.format(
+                booking_id=booking_id,
+                booking_id_spoken=self._speak_booking_id(booking_id),
+                treatment=treatment,
+                date=date_text or date,
+                time=time_text or start_time,
+            )
+            details = {
+                "BookingID": booking_id,
+                "treatment": treatment,
+                "date": date,
+                "time": start_time,
+                "StartTime": start_time,
+                "EndTime": end_time,
+                "ClinicID": str(timeslot.get("ClinicID") or booking.get("clinicId") or booking.get("ClinicID") or booking.get("clinic_id") or ""),
+                "TreatmentID": str(timeslot.get("TreatmentID") or booking.get("treatmentId") or booking.get("TreatmentID") or booking.get("treatment_id") or ""),
+                "ClinicianID": str(timeslot.get("ClinicianID") or booking.get("clinicianId") or booking.get("ClinicianID") or booking.get("clinician_id") or ""),
+                "FirstName": patient.get("FirstName") or booking.get("firstName") or booking.get("FirstName") or booking.get("first_name") or "",
+                "LastName": patient.get("LastName") or booking.get("lastName") or booking.get("LastName") or booking.get("last_name") or "",
+                "PhoneNumber": str(patient.get("MobilePhoneNumber") or booking.get("mobilePhoneNumber") or booking.get("PhoneNumber") or booking.get("phone_number") or ""),
+                "SSN": patient.get("PatientPersonalIdentification") or personnr,
+                "Status": status,
+            }
+            if self.call_data:
+                self.call_data.old_appointment_details = details
+
+            return {
+                "suksess": True,
+                "data": booking,
+                "melding": success_message,
+                "already_cancelled": False,
+                "booking_details": details,
+            }
             
         finally:
             if update_task:
@@ -250,7 +254,10 @@ class ClientToolsMixin:
     ):
         """
         Cancels a booking after customer confirmation.
-        Requires: ssn, start_time, end_time, clinic_id, treatment_id, clinician_id
+        Uses OPUS cancellation endpoint (no n8n).
+
+        Requires: ssn + bookingId (available from get_client_detail booking_details["BookingID"]).
+        Legacy params (start/end/clinic/treatment/clinician) are still accepted for prompt compatibility.
         confirm should be True when customer confirms cancellation.
         """
         
@@ -263,8 +270,18 @@ class ClientToolsMixin:
                 "melding": cancelled_text
             }
         
-        if not ssn or not start_time or not end_time or not clinic_id or not treatment_id or not clinician_id:
-            error_text = "Booking details are required to cancel." if self._language_code() == "en" else "Bookingdetaljer er påkrevd for å avlyse."
+        booking_id = ""
+        if self.call_data and self.call_data.old_appointment_details:
+            booking_id = str(self.call_data.old_appointment_details.get("BookingID") or self.call_data.old_appointment_details.get("bookingId") or "")
+        # also allow passing bookingId via treatment_id field is NOT allowed; must come from details
+
+        if not booking_id:
+            # try to derive from the most recent get_client_detail response stored on call_data if present
+            if self.call_data and isinstance(getattr(self.call_data, "old_appointment_details", None), dict):
+                booking_id = str(self.call_data.old_appointment_details.get("BookingID") or "")
+
+        if not booking_id:
+            error_text = "Booking ID is required to cancel." if self._language_code() == "en" else "Booking-ID er påkrevd for å avlyse."
             return {
                 "suksess": False,
                 "melding": error_text
@@ -307,65 +324,28 @@ class ClientToolsMixin:
         try:
             update_task = asyncio.create_task(periodic_updates())
 
-            webhook_url = CANCEL_BOOKING_URL
-            
-            data = {
-                "SSN": ssn,
-                "StartTime": start_time,
-                "EndTime": end_time,
-                "ClinicID": clinic_id,
-                "TreatmentID": treatment_id,
-                "ClinicianID": clinician_id
-            }
-            data.update(self.booking_config)
-            
-            print(f"[WEBHOOK] POST {webhook_url}")
-            print(f"[WEBHOOK PAYLOAD] {json.dumps(data, indent=2, ensure_ascii=False)}")
-            
-            webhook_response = await self._call_webhook_with_retry('POST', webhook_url, data)
-            
-            if webhook_response is None:
-                failure_text = self._get_text("cancel_booking_failure")
-                if not failure_text:
-                    failure_text = "Beklager, jeg klarte ikke å avlyse bookingen. Prøv igjen senere eller kontakt oss direkte." if self._language_code() == "no" else "Sorry, I couldn't cancel the booking. Please try again later or contact us directly."
+            if not self.call_data or not self.call_data.business_id:
                 return {
                     "suksess": False,
-                    "melding": failure_text
+                    "melding": self._technical_error_message("message") or ("Missing business_id" if self._language_code() == "en" else "Mangler business_id"),
                 }
-            
-            response_status = webhook_response['status']
-            response_text = webhook_response['text']
-            result = webhook_response['json'] if webhook_response['json'] is not None else response_text
-            
-            print(f"[WEBHOOK RESPONSE] Status: {response_status}")
-            print(f"[WEBHOOK RESPONSE] Body: {json.dumps(result, indent=2, ensure_ascii=False) if isinstance(result, dict) else response_text}")
-            
-            if response_status == 200:
-                if isinstance(result, dict) and result.get("suksess", False):
-                    success_text = self._get_text("cancel_booking_success")
-                    if not success_text:
-                        success_text = "Bookingen din er nå avlyst. Er det noe annet jeg kan hjelpe deg med?" if self._language_code() == "no" else "Your booking has been cancelled. Is there anything else I can help you with?"
-                    return {
-                        "suksess": True,
-                        "data": result,
-                        "melding": success_text
-                    }
-                else:
-                    failure_text = self._get_text("cancel_booking_failure")
-                    if not failure_text:
-                        failure_text = "Beklager, jeg klarte ikke å avlyse bookingen. Prøv igjen senere eller kontakt oss direkte." if self._language_code() == "no" else "Sorry, I couldn't cancel the booking. Please try again later or contact us directly."
-                    return {
-                        "suksess": False,
-                        "melding": failure_text
-                    }
-            else:
-                failure_text = self._get_text("cancel_booking_failure")
-                if not failure_text:
-                    failure_text = "Beklager, jeg klarte ikke å avlyse bookingen. Prøv igjen senere eller kontakt oss direkte." if self._language_code() == "no" else "Sorry, I couldn't cancel the booking. Please try again later or contact us directly."
-                return {
-                    "suksess": False,
-                    "melding": failure_text
-                }
+
+            opus_result = await cancel_booking_opus(
+                business_id=self.call_data.business_id,
+                booking_id=booking_id,
+                pid=ssn,
+            )
+
+            if opus_result.get("success"):
+                success_text = self._get_text("cancel_booking_success")
+                if not success_text:
+                    success_text = "Bookingen din er nå avlyst. Er det noe annet jeg kan hjelpe deg med?" if self._language_code() == "no" else "Your booking has been cancelled. Is there anything else I can help you with?"
+                return {"suksess": True, "data": opus_result, "melding": success_text}
+
+            failure_text = self._get_text("cancel_booking_failure")
+            if not failure_text:
+                failure_text = "Beklager, jeg klarte ikke å avlyse bookingen. Prøv igjen senere eller kontakt oss direkte." if self._language_code() == "no" else "Sorry, I couldn't cancel the booking. Please try again later or contact us directly."
+            return {"suksess": False, "melding": f"{failure_text} {opus_result.get('message','')}".strip()}
             
         finally:
             if update_task:
@@ -407,7 +387,7 @@ class ClientToolsMixin:
             )
             await context.wait_for_playout()
             
-            await self.samle_personnummer_med_dtmf(context)
+            await self.samle_personnummer_med_dtmf(context, purpose="booking")
             
             if not self.call_data.collected_personnummer:
                 return {

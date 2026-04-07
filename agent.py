@@ -7,6 +7,7 @@ import threading
 from livekit import agents, rtc
 from livekit.agents import AgentSession, APIConnectOptions, RoomInputOptions
 from livekit.agents.voice.agent_session import SessionConnectOptions
+from livekit.agents.job import JobProcess
 from livekit.plugins import (
     openai,
     elevenlabs,
@@ -19,39 +20,94 @@ import config.constants as cfg
 from config.constants import ANBEFALT
 from core.call_data import CallData
 from core.assistant import Assistant
-from utils.helpers import extract_phone_from_room_name
+from utils.helpers import parse_room_name
+from utils.cache import TTLCache
 from innstillinger import fetch_business_settings_by_phone
 from OPUS_routes import get_clinic_treatments
 
+# Latency optimization
+MIN_ENDPOINTING_DELAY = 0.08
+MAX_ENDPOINTING_DELAY = 0.35
+PREEMPTIVE_GENERATION = True
+FALSE_INTERRUPTION_TIMEOUT = 0.25
+MIN_INTERRUPTION_DURATION = 0.12
+
+
+def prewarm(proc: JobProcess) -> None:
+    # Cache heavy model initialization per worker process/thread.
+    proc.userdata["vad"] = silero.VAD.load()
+    # MultilingualModel needs JobContext (inference_executor); init in entrypoint only.
 
 async def entrypoint(ctx: agents.JobContext):
     is_console_mode = "console" in sys.argv
     
-    phone_number = extract_phone_from_room_name(ctx.room.name)
-    
+    room_data = parse_room_name(ctx.room.name)
+    phone_number = room_data.get("agent_number")
+    caller_phone = room_data.get("user_number") or ""
+    room_business_id = room_data.get("business_id") or ""
+
     if not phone_number:
         phone_number = "+4723507256"
+
+    print(f"[ENTRYPOINT] Room parse: agent_number={phone_number}, caller_phone={caller_phone}, business_id={room_business_id}")
     
-    print(f"[ENTRYPOINT] Initial phone number from room name: {phone_number}")
-    
-    # Fetch business settings at startup using phone number
-    try:
-        cfg.business_settings = await fetch_business_settings_by_phone(phone_number)
-        print(f"[ENTRYPOINT] Successfully fetched business settings for phone: {phone_number}")
-    except Exception as e:
-        print(f"[ENTRYPOINT] ERROR: Failed to fetch business settings: {e}")
-        raise RuntimeError(f"Could not fetch business settings for phone number: {phone_number}. Error: {e}")
-    
-    business_settings = cfg.business_settings
+    def _norm_phone(n: str) -> str:
+        return ("+" + "".join(ch for ch in (n or "") if ch.isdigit())) if n else ""
+
+    # 30-min in-memory cache (per worker process), bucketed by agent_number
+    if "settings_cache_by_agent" not in ctx.proc.userdata:
+        ctx.proc.userdata["settings_cache_by_agent"] = {}
+    if "treatments_cache_by_agent" not in ctx.proc.userdata:
+        ctx.proc.userdata["treatments_cache_by_agent"] = {}
+
+    agent_bucket = _norm_phone(phone_number)
+    if not agent_bucket:
+        agent_bucket = "unknown-agent"
+
+    settings_cache_by_agent = ctx.proc.userdata["settings_cache_by_agent"]
+    treatments_cache_by_agent = ctx.proc.userdata["treatments_cache_by_agent"]
+
+    if agent_bucket not in settings_cache_by_agent:
+        settings_cache_by_agent[agent_bucket] = TTLCache(ttl_seconds=1800.0, max_items=256)
+    if agent_bucket not in treatments_cache_by_agent:
+        treatments_cache_by_agent[agent_bucket] = TTLCache(ttl_seconds=1800.0, max_items=256)
+
+    settings_cache: TTLCache[str, dict] = settings_cache_by_agent[agent_bucket]
+    treatments_cache: TTLCache[str, list] = treatments_cache_by_agent[agent_bucket]
+
+    # Fetch business settings at startup using agent/business phone number
+    cache_key_settings = f"settings:phone:{agent_bucket}"
+    business_settings = settings_cache.get(cache_key_settings)
+    if business_settings:
+        print(f"[CACHE] business_settings HIT bucket={agent_bucket} key={cache_key_settings}")
+    else:
+        print(f"[CACHE] business_settings MISS bucket={agent_bucket} key={cache_key_settings}")
+        try:
+            business_settings = await fetch_business_settings_by_phone(phone_number)
+            settings_cache.set(cache_key_settings, business_settings)
+            print(f"[ENTRYPOINT] Successfully fetched business settings for phone: {phone_number}")
+        except Exception as e:
+            print(f"[ENTRYPOINT] ERROR: Failed to fetch business settings: {e}")
+            raise RuntimeError(f"Could not fetch business settings for phone number: {phone_number}. Error: {e}")
+
+    cfg.business_settings = business_settings
 
     # Fetch clinic treatments (Opus API)
     clinic_treatments = []
-    if business_settings and 'business_id' in business_settings:
-        try:
-            clinic_treatments = await get_clinic_treatments(business_settings['business_id'])
-            print(f"[ENTRYPOINT] Fetched {len(clinic_treatments)} treatments for business {business_settings['business_id']}")
-        except Exception as e:
-            print(f"[ENTRYPOINT] Warning: Failed to fetch treatments: {e}")
+    if business_settings and "business_id" in business_settings:
+        bid = str(business_settings["business_id"])
+        cache_key_treatments = f"treatments:business_id:{bid}"
+        clinic_treatments = treatments_cache.get(cache_key_treatments) or []
+        if clinic_treatments:
+            print(f"[CACHE] clinic_treatments HIT bucket={agent_bucket} key={cache_key_treatments} ({len(clinic_treatments)})")
+        else:
+            print(f"[CACHE] clinic_treatments MISS bucket={agent_bucket} key={cache_key_treatments}")
+            try:
+                clinic_treatments = await get_clinic_treatments(bid)
+                treatments_cache.set(cache_key_treatments, clinic_treatments)
+                print(f"[ENTRYPOINT] Fetched {len(clinic_treatments)} treatments for business {bid}")
+            except Exception as e:
+                print(f"[ENTRYPOINT] Warning: Failed to fetch treatments: {e}")
     
     # QDRANT CONVERSATION HISTORY COMMENTED OUT - QDRANT NOT WORKING
     conversation_history = None
@@ -65,7 +121,7 @@ async def entrypoint(ctx: agents.JobContext):
     
     # Get model settings from business configuration
     stt_model = business_settings.get('stt_model', 'gpt-4o-transcribe')
-    llm_model = business_settings.get('llm_model', 'gpt-4o')
+    # llm_model = business_settings.get('llm_model', 'gpt-4o')
     stt_prompt = business_settings.get('stt_prompt', 'This is a conversation between an AI receptionist and a customer. The conversation can be in either Norwegian or English. Transcribe accurately in the language being spoken with correct punctuation and formatting.')
 
     session = AgentSession(
@@ -75,7 +131,8 @@ async def entrypoint(ctx: agents.JobContext):
         ),
         llm=openai.LLM(
             model='gpt-4o',
-            temperature=0.4
+            temperature=0.15,
+            max_completion_tokens=500,
         ),
         tts=elevenlabs.TTS(
             voice_id=voice_id,
@@ -86,18 +143,22 @@ async def entrypoint(ctx: agents.JobContext):
                 speed=voice_speed,
             )
         ),
-        vad=silero.VAD.load(),
-        turn_detection=MultilingualModel(),
+        vad=ctx.proc.userdata.get("vad") or silero.VAD.load(),
+        turn_detection=ctx.proc.userdata.get("turn_detection") or MultilingualModel(),
         max_tool_steps=8,
-        preemptive_generation=True,
         conn_options=SessionConnectOptions(
             llm_conn_options=APIConnectOptions(timeout=60.0),
         ),
+        min_endpointing_delay=MIN_ENDPOINTING_DELAY,
+        max_endpointing_delay=MAX_ENDPOINTING_DELAY,
+        preemptive_generation=PREEMPTIVE_GENERATION,
+        false_interruption_timeout=FALSE_INTERRUPTION_TIMEOUT,
+        min_interruption_duration=MIN_INTERRUPTION_DURATION,
     )
 
     # Initialize CallData for the session
-    business_id = business_settings.get('business_id', '') if business_settings else ''
-    call_data = CallData(phone_number=phone_number or "", business_id=business_id, is_console_mode=is_console_mode)
+    business_id = room_business_id or (business_settings.get('business_id', '') if business_settings else '')
+    call_data = CallData(phone_number=phone_number or "", caller_phone=caller_phone, business_id=business_id, is_console_mode=is_console_mode)
     if call_data.dtmf_event is None:
         call_data.dtmf_event = asyncio.Event()
     
@@ -109,99 +170,68 @@ async def entrypoint(ctx: agents.JobContext):
     
     # Check existing participants for caller's phone number
     async def check_existing_participants():
-        """Check existing participants to extract caller's phone number - THIS IS THE CORRECT NUMBER TO USE"""
+        """Check existing participants to extract caller's phone number into caller_phone."""
         await asyncio.sleep(0.5)
         if ctx.room:
             for participant in ctx.room.remote_participants.values():
                 if participant.identity.startswith('sip_'):
                     identity = participant.identity
                     print(f"[EXISTING PARTICIPANT] Identity: {identity}")
-                    phone_match = re.search(r'\+47\d{8}', identity)
+                    phone_match = re.search(r'\+47\d{8}', identity) or re.search(r'\+?\d{8,15}', identity)
                     if phone_match:
                         extracted_number = phone_match.group(0)
+                        if not extracted_number.startswith('+'):
+                            extracted_number = f"+{extracted_number}"
                         if call_data:
-                            print(f"[EXISTING PARTICIPANT] Using identity number as caller number: {extracted_number} (was: {call_data.phone_number})")
-                            call_data.phone_number = extracted_number
-                            print(f"[CALL DATA] Updated phone_number to: {call_data.phone_number} - THIS IS THE NUMBER TO USE")
+                            print(f"[EXISTING PARTICIPANT] Caller phone: {extracted_number} (was: {call_data.caller_phone})")
+                            call_data.caller_phone = extracted_number
+                            print(f"[CALL DATA] Updated caller_phone to: {call_data.caller_phone}")
                             return
-                    else:
-                        phone_match = re.search(r'\+?\d{8,15}', identity)
-                        if phone_match:
-                            extracted_number = phone_match.group(0)
-                            if not extracted_number.startswith('+'):
-                                extracted_number = f"+{extracted_number.lstrip('+')}"
-                            if call_data:
-                                print(f"[EXISTING PARTICIPANT] Using identity number as caller number: {extracted_number} (was: {call_data.phone_number})")
-                                call_data.phone_number = extracted_number
-                                print(f"[CALL DATA] Updated phone_number to: {call_data.phone_number} - THIS IS THE NUMBER TO USE")
-                                return
     
     asyncio.create_task(check_existing_participants())
     
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
-        """Extract actual caller's phone number from SIP participant - USE IDENTITY NUMBER"""
+        """Extract caller's phone number from SIP participant into caller_phone."""
         if participant.identity.startswith('sip_'):
             identity = participant.identity
             print(f"[PARTICIPANT CONNECTED] Identity: {identity}")
-            print(f"[PARTICIPANT CONNECTED] Name: {getattr(participant, 'name', 'N/A')}")
-            print(f"[PARTICIPANT CONNECTED] Metadata: {getattr(participant, 'metadata', 'N/A')}")
-            
-            phone_match = re.search(r'\+47\d{8}', identity)
+
+            phone_match = re.search(r'\+47\d{8}', identity) or re.search(r'\+?\d{8,15}', identity)
             if phone_match:
                 extracted_number = phone_match.group(0)
+                if not extracted_number.startswith('+'):
+                    extracted_number = f"+{extracted_number}"
                 if call_data:
-                    print(f"[PARTICIPANT CONNECTED] Using identity number as caller number: {extracted_number} (was: {call_data.phone_number})")
-                    call_data.phone_number = extracted_number
-                    print(f"[CALL DATA] Updated phone_number to: {call_data.phone_number} - THIS IS THE NUMBER TO USE")
+                    print(f"[PARTICIPANT CONNECTED] Caller phone: {extracted_number} (was: {call_data.caller_phone})")
+                    call_data.caller_phone = extracted_number
+                    print(f"[CALL DATA] Updated caller_phone to: {call_data.caller_phone}")
                     return
-            else:
-                phone_match = re.search(r'\+?\d{8,15}', identity)
-                if phone_match:
-                    extracted_number = phone_match.group(0)
-                    if not extracted_number.startswith('+'):
-                        extracted_number = f"+{extracted_number.lstrip('+')}"
-                    if call_data:
-                        print(f"[PARTICIPANT CONNECTED] Using identity number as caller number: {extracted_number} (was: {call_data.phone_number})")
-                        call_data.phone_number = extracted_number
-                        print(f"[CALL DATA] Updated phone_number to: {call_data.phone_number} - THIS IS THE NUMBER TO USE")
-                        return
-            
-            metadata = getattr(participant, 'metadata', None)
-            if metadata:
-                print(f"[PARTICIPANT] Checking metadata: {metadata}")
-                phone_match = re.search(r'\+47\d{8}', metadata)
-                if phone_match:
-                    extracted_number = phone_match.group(0)
-                    if call_data and extracted_number != call_data.phone_number:
-                        print(f"[PARTICIPANT] Extracted caller number from metadata: {extracted_number}")
-                        call_data.phone_number = extracted_number
-                        print(f"[CALL DATA] Updated phone_number to: {call_data.phone_number}")
-                        return
-            
-            name = getattr(participant, 'name', None)
-            if name:
-                print(f"[PARTICIPANT] Checking name: {name}")
-                phone_match = re.search(r'\+47\d{8}', name)
-                if phone_match:
-                    extracted_number = phone_match.group(0)
-                    if call_data and extracted_number != call_data.phone_number:
-                        print(f"[PARTICIPANT] Extracted caller number from name: {extracted_number}")
-                        call_data.phone_number = extracted_number
-                        print(f"[CALL DATA] Updated phone_number to: {call_data.phone_number}")
-                        return
-            
-            print(f"[PARTICIPANT] Could not extract caller number from participant. Using room name number: {call_data.phone_number if call_data else 'N/A'}")
+
+            for source_name in ("metadata", "name"):
+                source_val = getattr(participant, source_name, None)
+                if source_val:
+                    m = re.search(r'\+?\d{8,15}', str(source_val))
+                    if m:
+                        extracted_number = m.group(0)
+                        if not extracted_number.startswith('+'):
+                            extracted_number = f"+{extracted_number}"
+                        if call_data:
+                            print(f"[PARTICIPANT] Caller phone from {source_name}: {extracted_number}")
+                            call_data.caller_phone = extracted_number
+                            return
+
+            print(f"[PARTICIPANT] Could not extract caller number. caller_phone={call_data.caller_phone if call_data else 'N/A'}")
     
     def normalize_dtmf_digit(raw_digit):
         """Normalize DTMF digit to standard format. Handles various # representations."""
         if raw_digit is None:
-            print(f"[DTMF NORMALIZE] Input is None")
+            print("[DTMF NORMALIZE] Input is None")
             return None
         
         value = str(raw_digit).strip()
         if not value:
-            print(f"[DTMF NORMALIZE] Empty value after conversion")
+            print("[DTMF NORMALIZE] Empty value after conversion")
             return None
         
         print(f"[DTMF NORMALIZE] Processing: '{raw_digit}' -> '{value}'")
@@ -312,7 +342,7 @@ async def entrypoint(ctx: agents.JobContext):
                 if call_data.dtmf_event:
                     call_data.dtmf_event.set()
             else:
-                print(f" -> ✗ FAILED TO NORMALIZE (returned None) - THIS DTMF WAS NOT ADDED!")
+                print(" -> ✗ FAILED TO NORMALIZE (returned None) - THIS DTMF WAS NOT ADDED!")
                 print(f"[DTMF] Raw digit was: '{raw_digit}' (type: {type(raw_digit)})")
     
     # QDRANT CONVERSATION HISTORY COMMENTED OUT - QDRANT NOT WORKING
@@ -327,7 +357,7 @@ async def entrypoint(ctx: agents.JobContext):
                 # if call_data.phone_number:
                 #     await save_call_log(call_data, business_name)
                 print("[ENTRYPOINT] save_log: Call data: " + str(call_data))
-            except Exception as e:
+            except Exception:
                 pass
         
         asyncio.create_task(save_log())
@@ -338,7 +368,7 @@ async def entrypoint(ctx: agents.JobContext):
     business_type = business_settings.get('business_type', 'business')
     business_name = business_settings.get('business_name', 'Business')
     booking_term = business_settings.get('booking_term', 'booking')
-    custom_terms = business_settings.get('custom_terms', None)
+    # custom_terms = business_settings.get('custom_terms', None)
     agent_name = business_settings.get('agent_navn', 'AI Resepsjonist')
     
     assistant = Assistant(
@@ -420,12 +450,14 @@ if __name__ == "__main__":
     
     agents.cli.run_app(agents.WorkerOptions(
         entrypoint_fnc=entrypoint,
+        prewarm_fnc=prewarm,
         initialize_process_timeout=60.0,
         port=8082,
         ws_url=cfg.LIVEKIT_URL or None,
         api_key=cfg.LIVEKIT_API_KEY or None,
         api_secret=cfg.LIVEKIT_API_SECRET or None,
         agent_name=cfg.AGENT_NAME,
+        
     ))
 
 

@@ -17,5 +17,5 @@ Start-Process -FilePath $Python `
     -RedirectStandardOutput $OutLog `
     -RedirectStandardError  $ErrLog
 
-Write-Host "✅ LiveKit Agent started (start mode). Logs: $OutLog"
+Write-Host "LiveKit Agent started (start mode). Logs: $OutLog"
 

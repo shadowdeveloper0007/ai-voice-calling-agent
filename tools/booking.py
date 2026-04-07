@@ -20,22 +20,113 @@ class BookingToolsMixin:
     @function_tool()
     async def get_available_treatments(self, ctx: RunContext) -> str:
         """
-        Get list of available treatments/services at the clinic.
-        Call this when user asks what treatments/services are provided or asks if a specific treatment is available.
+        Return the full treatment menu (numbered, with durations).
+        Call ONLY when the user explicitly asks what treatments you offer, or matching failed after a clarifying question.
+        Do NOT call when the user already named a treatment mappable from the CLINIC TREATMENT CATALOG in system instructions — use get_available_timeslots with the exact Name instead.
         """
         if not self.clinic_treatments:
              lang = self._language_code()
              return "No treatment information available." if lang == "en" else "Ingen behandlingsinformasjon tilgjengelig."
         
         try:
-            treatments_json = json.dumps(self.clinic_treatments, ensure_ascii=False, indent=2)
-            print(f"[TOOL] get_available_treatments returning {len(treatments_json)} chars (Total treatments: {len(self.clinic_treatments)})")
-            
             lang = self._language_code()
-            prefix = "Available Treatments JSON:" if lang == "en" else "Tilgjengelige Behandlinger JSON:"
-            return f"{prefix}\n{treatments_json}"
+            if lang == "en":
+                # English-friendly, numbered list with durations.
+                # Keep the exact Norwegian name in parentheses for precise selection/matching.
+                def _to_en(name_no: str, desc_no: str) -> str:
+                    # Dynamic "good enough" translation via keyword/phrase mapping.
+                    # (We keep the exact Norwegian name separately for selection.)
+                    raw = (name_no or "").strip()
+                    if not raw:
+                        raw = (desc_no or "").strip()
+                    if not raw:
+                        return "Treatment"
+
+                    # Remove leading list numbers like "1. " or "9. "
+                    raw = re.sub(r"^\s*\d+\.\s*", "", raw)
+
+                    s = raw.lower()
+                    d = (desc_no or "").lower()
+
+                    # If it already looks English, keep it.
+                    if any(tok in s for tok in ("consultation", "invisalign", "recall", "checkup", "emergency", "whitening", "cleaning")):
+                        return raw
+
+                    # Prefer strong signals from description if name is vague.
+                    signals = s + " " + d
+
+                    phrase_map = [
+                        ("recall hos tannlege", "Routine dentist checkup (recall)"),
+                        ("kontroll (recall)", "Checkup (recall)"),
+                        ("akutt tannbehandling", "Emergency dental treatment"),
+                        ("konsultasjon ny pasient", "New patient consultation"),
+                        ("time hos tannlege", "Dentist appointment (specific problem)"),
+                        ("smiledesign / invisalign", "Smiledesign / Invisalign consultation"),
+                        ("bleking av tenner", "Teeth whitening"),
+                    ]
+                    for no_phrase, en_phrase in phrase_map:
+                        if no_phrase in signals:
+                            return en_phrase
+
+                    # Word-level mapping (order matters; longer first).
+                    word_map = [
+                        ("tannpleier", "dental hygienist"),
+                        ("tannlege", "dentist"),
+                        ("konsultasjon", "consultation"),
+                        ("kontroll", "checkup"),
+                        ("undersøkelse", "examination"),
+                        ("rutineundersøkelse", "routine examination"),
+                        ("akutt", "emergency"),
+                        ("rens", "cleaning"),
+                        ("bleking", "whitening"),
+                        ("tenner", "teeth"),
+                        ("implantatbro", "implant bridge"),
+                        ("implantat", "implant"),
+                        ("periodontitt", "periodontitis"),
+                        ("perio", "periodontal"),
+                        ("behandling", "treatment"),
+                        ("smiledesign", "smiledesign"),
+                        ("hos", "with"),
+                        ("ny pasient", "new patient"),
+                        ("budapest", "budapest"),
+                    ]
+
+                    out = s
+                    for no_word, en_word in word_map:
+                        out = out.replace(no_word, en_word)
+
+                    # Cleanup spacing/punctuation, then title-case lightly.
+                    out = re.sub(r"\s+", " ", out).strip(" -–—")
+                    if not out:
+                        return raw
+                    return out[:1].upper() + out[1:]
+
+                lines = []
+                for i, t in enumerate(self.clinic_treatments, 1):
+                    name_no = (t.get("Name") or t.get("name") or "").strip()
+                    desc_no = (t.get("Description") or t.get("description") or "").strip()
+                    duration = t.get("Duration")
+                    duration_str = f"{duration} min" if isinstance(duration, int) else "duration unknown"
+                    name_en = _to_en(name_no, desc_no)
+                    lines.append(f"{i}. {name_en} ({duration_str}) — {name_no}")
+
+                result = "Available treatments:\n" + "\n".join(lines)
+                print(f"[TOOL] get_available_treatments returning {len(result)} chars (Total treatments: {len(self.clinic_treatments)})")
+                return result
+
+            lines_no = []
+            for i, t in enumerate(self.clinic_treatments, 1):
+                name = (t.get("Name") or t.get("name") or "").strip()
+                if not name:
+                    continue
+                dur = t.get("Duration")
+                dur_s = f"{int(dur)} min" if isinstance(dur, (int, float)) else ""
+                lines_no.append(f"{i}. {name} — {dur_s}" if dur_s else f"{i}. {name}")
+            result_no = "Tilgjengelige behandlinger:\n" + "\n".join(lines_no)
+            print(f"[TOOL] get_available_treatments returning {len(result_no)} chars (Total treatments: {len(self.clinic_treatments)})")
+            return result_no
         except Exception as e:
-            print(f"[TOOL] Error dumping treatments to JSON: {e}")
+            print(f"[TOOL] Error listing treatments: {e}")
             return "Error retrieving treatments."
         
 
@@ -93,6 +184,11 @@ class BookingToolsMixin:
                 if clinician_name:
                     msg += f" hos {clinician_name}"
                 msg += f". Jeg ser du allerede er registrert som {patient_name}. Skal jeg booke denne for deg?"
+            return {
+                "patient_type": "existing_patient",
+                "isExistingPatient": True,
+                "message": msg,
+            }
         else:
             if lang == "en":
                 msg = f"You selected the {time_str} to {end_str} slot"
@@ -104,16 +200,21 @@ class BookingToolsMixin:
                 if clinician_name:
                     msg += f" hos {clinician_name}"
                 msg += ". Kan jeg få fulle navnet ditt?"
-        return msg
+            return {
+                "patient_type": "new_patient",
+                "isExistingPatient": False,
+                "message": msg,
+            }
 
     @function_tool()
     async def samle_email(self, ctx: RunContext, email: str) -> str:
         """Validate and store the customer's email address for booking.
-        Call this when the customer provides their email. Validates format before storing.
-        If the email is invalid, returns an error asking the customer to provide it again.
+        ONLY call this when the customer has explicitly stated their email address out loud.
+        NEVER guess, infer, or construct an email from the customer's name or any other information.
+        If the customer has not yet provided an email, ask them for it first and wait for their response.
 
         Args:
-            email: The email address provided by the customer (e.g. "tarun@gmail.com").
+            email: The exact email address spoken by the customer. Must be explicitly provided by the customer.
         
         Returns:
             Confirmation message if valid, or error message if invalid format.
@@ -135,14 +236,43 @@ class BookingToolsMixin:
         return f"Jeg har registrert e-postadressen din som {cleaned}. Stemmer det?"
 
     @function_tool()
-    async def get_available_timeslots(self, ctx: RunContext, treatment_name: str, desired_date: str = "") -> str:
-        """
-        Find available timeslots for a treatment. IMPORTANT: Before calling this, you MUST first ask the customer
-        whether they want the first available appointment or a specific date. Never call without asking preference.
-        Returns multiple slots if available so the customer can choose.
+    async def samle_navn(self, ctx: RunContext, fornavn: str, etternavn: str) -> str:
+        """Capture and confirm the customer's full name for a new patient booking.
+        ONLY call this when the customer has explicitly stated their first and last name.
+        NEVER guess or infer a name. After calling, you MUST wait for the user to confirm
+        yes or no before proceeding.
 
         Args:
-            treatment_name: The name of the treatment (e.g., "Recall hos tannlege", "undersøkelse")
+            fornavn: The first name as spoken by the customer.
+            etternavn: The last name as spoken by the customer.
+
+        Returns:
+            Confirmation message asking the user to verify the name.
+        """
+        lang = self._language_code()
+        fornavn = fornavn.strip().title()
+        etternavn = etternavn.strip().title()
+
+        if self.call_data:
+            self.call_data.customer_first_name = fornavn
+            self.call_data.customer_last_name = etternavn
+
+        if lang == "en":
+            return f"I have your name as {fornavn} {etternavn}. Is that correct?"
+        return f"Jeg har registrert navnet ditt som {fornavn} {etternavn}. Stemmer det?"
+
+    @function_tool()
+    async def get_available_timeslots(self, ctx: RunContext, treatment_name: str, desired_date: str = "") -> str:
+        """
+        Find available timeslots for a treatment.
+        PREREQUISITES (all must be met before calling):
+          1. A specific treatment must be identified — NEVER call with a guessed treatment. Ask the customer first.
+          2. The customer must have stated their preference (first available vs specific date).
+          3. Personnummer must be collected via samle_personnummer_med_dtmf().
+        Use the EXACT treatment Name from the CLINIC TREATMENT CATALOG when possible.
+
+        Args:
+            treatment_name: Exact catalog Name or close phrase (e.g., "Recall hos tannlege", "undersøkelse"). Must not be empty or guessed.
             desired_date: Specific date in YYYY-MM-DD format (e.g., "2026-07-20"). If empty, finds first available from now.
         """
         lang = self._language_code()
@@ -168,16 +298,49 @@ class BookingToolsMixin:
                 'whitening': ['bleking', 'whitening', 'tannbleking'],
                 'emergency': ['akutt', 'emergency', 'acute'],
                 'introduction': ['introduksjon', 'introduction', 'ny pasient', 'new patient', 'førstegang'],
+                'dentist': ['tannlege', 'dentist', 'dentist appointment', 'dental appointment', 'dental'],
+                'hygienist': ['tannpleier', 'hygienist', 'dental hygienist'],
+                'periodontal': ['periodontal', 'periodontal-treatment', 'parodontitt'],
+                'implant': ['implant', 'implantat', 'implantbro'],
+                'recall': ['recall', 'kontroll'],
             }
             
             for key, variants in translations.items():
                 if any(v in treatment_name_lower for v in variants):
+                    matches = []
                     for treatment in self.clinic_treatments:
                         t_name = (treatment.get('Name') or treatment.get('name') or '').lower()
                         t_desc = (treatment.get('Description') or treatment.get('description') or '').lower()
                         if any(v in t_name or v in t_desc for v in variants):
-                            matched_treatment = treatment
-                            break
+                            matches.append(treatment)
+
+                    if key == "dentist" and matches:
+                        # "dentist appointment" is ambiguous. If the caller didn't say recall/checkup,
+                        # prefer "Time hos tannlege" (specific problem). If they said recall/checkup,
+                        # prefer recall/control treatments.
+                        wants_recall = any(
+                            k in treatment_name_lower
+                            for k in ("recall", "checkup", "check-up", "routine", "kontroll", "undersøk", "undersok")
+                        )
+                        if wants_recall:
+                            for t in matches:
+                                n = (t.get("Name") or t.get("name") or "").lower()
+                                d = (t.get("Description") or t.get("description") or "").lower()
+                                if "recall" in n or "kontroll" in n or "undersøk" in n or ("recall" in d and "tannlege" in d):
+                                    matched_treatment = t
+                                    break
+                        else:
+                            for t in matches:
+                                n = (t.get("Name") or t.get("name") or "").lower()
+                                d = (t.get("Description") or t.get("description") or "").lower()
+                                if "time hos tannlege" in n or "spesifikt problem" in d:
+                                    matched_treatment = t
+                                    break
+
+                        if not matched_treatment:
+                            matched_treatment = matches[0]
+                    elif matches:
+                        matched_treatment = matches[0]
                     break
         
         if not matched_treatment:
@@ -271,13 +434,13 @@ class BookingToolsMixin:
                 if lang == "en":
                     return (f"I found an appointment for {treatment_display_name} on {dt.strftime('%A, %B %d')} "
                             f"from {dt.strftime('%H:%M')} to {dt_end.strftime('%H:%M')} "
-                            f"with {clinician_name} ({title_en}). Should I book that for you?")
+                            f"with {clinician_name} ({title_en}). Would you like to select this slot?")
                 else:
                     day_names_no = ['mandag','tirsdag','onsdag','torsdag','fredag','lørdag','søndag']
                     month_names_no = ['januar','februar','mars','april','mai','juni','juli','august','september','oktober','november','desember']
                     return (f"Jeg fant en ledig time for {treatment_display_name} på {day_names_no[dt.weekday()]} "
                             f"{dt.day}. {month_names_no[dt.month-1]} fra klokken {dt.strftime('%H:%M')} til {dt_end.strftime('%H:%M')} "
-                            f"hos {clinician_name} ({clinician_title}). Skal jeg booke den for deg?")
+                            f"hos {clinician_name} ({clinician_title}). Ønsker du å velge denne timen?")
 
             slot_lines = []
             for i, s in enumerate(display_slots, 1):
@@ -359,7 +522,7 @@ class BookingToolsMixin:
         if self.call_data and self.call_data.collected_personnummer:
             _ = self.call_data.collected_personnummer
         elif self.call_data:
-            await self.samle_personnummer_med_dtmf(context)
+            await self.samle_personnummer_med_dtmf(context, purpose="booking")
             if not self.call_data.collected_personnummer:
                 return {
                     "suksess": False,
@@ -467,13 +630,68 @@ class BookingToolsMixin:
         if self.call_data and self.call_data.collected_personnummer:
             _ = self.call_data.collected_personnummer
         elif self.call_data:
-            await self.samle_personnummer_med_dtmf(context)
+            await self.samle_personnummer_med_dtmf(context, purpose="booking")
             if not self.call_data.collected_personnummer:
                 return {
                     "suksess": False,
                     "melding": self._get_text("personnummer_failed")
                 }
             _ = self.call_data.collected_personnummer
+
+        # Resolve treatment from free-text message when missing.
+        # (Without selected_treatment_id, OPUS flow cannot derive treatment_name and will abort.)
+        if self.call_data and not self.call_data.selected_treatment_id and self.clinic_treatments and kundeMelding:
+            msg_lower = kundeMelding.lower()
+
+            def _pick_treatment(predicate):
+                for t in self.clinic_treatments:
+                    t_name = (t.get("Name") or t.get("name") or "")
+                    t_desc = (t.get("Description") or t.get("description") or "")
+                    if predicate(t_name.lower(), t_desc.lower()):
+                        tid = t.get("ID") or t.get("id")
+                        if tid:
+                            self.call_data.selected_treatment_id = tid
+                            print(f"[OPUS FLOW] sjekk_onsket_time: resolved treatment_id={tid} from kundeMelding")
+                            return True
+                return False
+
+            # Emergency / acute
+            if any(k in msg_lower for k in ("emergency", "acute", "pain", "toothache", "akutt", "smerte")):
+                _pick_treatment(lambda n, d: "akutt" in n or "akutt" in d or "emergency" in n or "emergency" in d)
+
+            # New patient / consultation
+            if not self.call_data.selected_treatment_id and any(k in msg_lower for k in ("new patient", "new", "første", "førstegang", "konsultasjon", "consultation")):
+                _pick_treatment(lambda n, d: "ny pasient" in n or "konsultasjon" in n or "consult" in n or "new patient" in d)
+
+            # Whitening
+            if not self.call_data.selected_treatment_id and any(k in msg_lower for k in ("whitening", "bleking")):
+                _pick_treatment(lambda n, d: "bleking" in n or "whitening" in n or "blek" in d)
+
+            # Cleaning / perio
+            if not self.call_data.selected_treatment_id and any(k in msg_lower for k in ("cleaning", "rens", "perio", "periodont", "tannrens")):
+                _pick_treatment(lambda n, d: "rens" in n or "perio" in n or "periodont" in d or "tannrens" in d)
+
+            # Dentist appointment is ambiguous:
+            # - If recall/checkup/routine words exist -> pick recall/control type.
+            # - Otherwise -> pick "Time hos tannlege" (specific problem) when present.
+            if not self.call_data.selected_treatment_id and any(
+                k in msg_lower for k in ("dentist", "dental", "tannlege", "appointment", "time")
+            ):
+                wants_recall = any(
+                    k in msg_lower
+                    for k in ("recall", "checkup", "check-up", "check up", "routine", "kontroll", "sjekk", "undersøk", "undersok")
+                )
+                if wants_recall:
+                    if not _pick_treatment(
+                        lambda n, d: ("tannlege" in n and ("recall" in n or "kontroll" in n or "undersøk" in n))
+                        or ("recall" in d and "tannlege" in d)
+                    ):
+                        _pick_treatment(lambda n, d: "recall" in n or "kontroll" in n or "undersøk" in n or "check" in d)
+                else:
+                    # Prefer specific problem dentist appointment.
+                    if not _pick_treatment(lambda n, d: "time hos tannlege" in n or "spesifikt problem" in d):
+                        # Fallback: any tannlege entry that is NOT recall/control.
+                        _pick_treatment(lambda n, d: "tannlege" in n and not ("recall" in n or "kontroll" in n))
         
         update_task = None
 
@@ -562,7 +780,7 @@ class BookingToolsMixin:
         if self.call_data and self.call_data.collected_personnummer:
             personnr = self.call_data.collected_personnummer
         elif self.call_data:
-            await self.samle_personnummer_med_dtmf(context)
+            await self.samle_personnummer_med_dtmf(context, purpose="booking")
             if not self.call_data.collected_personnummer:
                 return {
                     "suksess": False,
@@ -570,6 +788,7 @@ class BookingToolsMixin:
                 }
             personnr = self.call_data.collected_personnummer
         
+        # Phone number choice must be explicitly confirmed for new patients.
         mobilnr = self.get_phone_number_for_booking()
         
         update_task = None
@@ -632,6 +851,18 @@ class BookingToolsMixin:
                 patient_last = slot.get('patientLastName', '') or Etternavn
                 display_name = patient_first or Fornavn
 
+                if (not is_existing) and self.call_data and (not self.call_data.phone_choice_confirmed):
+                    calling = self.call_data.caller_phone or ""
+                    if self._language_code() == "en":
+                        return {
+                            "suksess": False,
+                            "melding": f"Before I book it, do you want to use the number you're calling from ({calling}), or do you want to provide a different number?",
+                        }
+                    return {
+                        "suksess": False,
+                        "melding": f"Før jeg booker, vil du at jeg skal bruke nummeret du ringer fra ({calling}), eller vil du oppgi et annet nummer?",
+                    }
+
                 opus_result = None
 
                 if is_existing:
@@ -645,16 +876,61 @@ class BookingToolsMixin:
                         slot_end=slot_end,
                     )
 
-                if not opus_result or not opus_result.get("success"):
-                    if is_existing:
-                        print("[OPUS FLOW] existing-patient/book failed — falling back to new-patient/book")
+                if is_existing and (not opus_result or not opus_result.get("success")):
+                    msg = (opus_result or {}).get("message", "") or ""
+                    # Treat conflict as "already booked" and stop (never try new-patient booking).
+                    if "conflict" in msg.lower():
+                        if self._language_code() == "en":
+                            return {
+                                "suksess": False,
+                                "melding": "It looks like this appointment was already booked (conflict). If I can help with anything else, feel free to ask.",
+                            }
+                        return {
+                            "suksess": False,
+                            "melding": "Det ser ut som timen allerede er booket (konflikt). Hvis jeg kan hjelpe med noe annet, er det bare å si ifra.",
+                        }
+
+                    failure_prefix = self._get_text("booking_failure") or "Klarte ikke å booke timen i systemet."
+                    return {
+                        "suksess": False,
+                        "melding": f"{failure_prefix} {msg}".strip(),
+                    }
+
+                if (not is_existing) and (not opus_result or not opus_result.get("success")):
+                    # New patient booking requires full name + email.
+                    first_name = (patient_first or Fornavn or "").strip()
+                    last_name = (patient_last or Etternavn or "").strip()
+                    email = (self.call_data.collected_email.strip() if self.call_data else "")
+
+                    if not first_name or not last_name:
+                        if self._language_code() == "en":
+                            return {
+                                "suksess": False,
+                                "melding": "I need your full name before I can book this appointment. Please tell me your first and last name.",
+                            }
+                        return {
+                            "suksess": False,
+                            "melding": "Jeg trenger fullt navn før jeg kan booke timen. Kan du oppgi fornavn og etternavn?",
+                        }
+
+                    if not email:
+                        if self._language_code() == "en":
+                            return {
+                                "suksess": False,
+                                "melding": "Email is required to complete the booking. Please provide your email address.",
+                            }
+                        return {
+                            "suksess": False,
+                            "melding": "E-post er påkrevd for å fullføre bookingen. Kan du oppgi e-postadressen din?",
+                        }
+
                     opus_result = await book_new_patient(
                         business_id=self.call_data.business_id,
                         pid=personnr,
-                        first_name=patient_first or Fornavn,
-                        last_name=patient_last or Etternavn,
+                        first_name=first_name,
+                        last_name=last_name,
                         phone=mobilnr,
-                        email=self.call_data.collected_email if self.call_data else "",
+                        email=email,
                         treatment_id=int(treatment_id_val),
                         clinician_id=int(clinician_id_val),
                         slot_start=slot_start,
@@ -665,18 +941,38 @@ class BookingToolsMixin:
                     if self.call_data:
                         self.call_data.appointment_booked = True
 
+                    booking_id = opus_result.get("bookingId") or opus_result.get("booking_id")
+                    confirmation_number = opus_result.get("confirmationNumber") or opus_result.get("confirmation_number")
+
                     clinician_info = self.call_data.selected_clinician if self.call_data else None
                     if clinician_info and clinician_info.get("name"):
                         c_name = clinician_info["name"]
                         c_title = clinician_info.get("title", "Tannlege")
                         if self._language_code() == "en":
                             title_en = "Dentist" if "tannlege" in c_title.lower() else c_title
-                            success_message = f"Your appointment is booked, {display_name}. Your dentist is {c_name} ({title_en})."
+                            success_message = f"Your booking is confirmed, {display_name}. Your dentist is {c_name} ({title_en})."
                         else:
-                            success_message = f"Timen din er booket, {display_name}. Din tannlege er {c_name} ({c_title})."
+                            success_message = f"Timen din er bekreftet, {display_name}. Din tannlege er {c_name} ({c_title})."
                     else:
                         success_template = self._get_text("booking_success") or "Time er nå booket for {name}."
                         success_message = success_template.format(name=display_name)
+
+                    # Append booking reference if available
+                    if booking_id:
+                        if self._language_code() == "en":
+                            success_message += f" Your booking ID is {booking_id}."
+                        else:
+                            success_message += f" Booking-ID er {booking_id}."
+                    if confirmation_number:
+                        if self._language_code() == "en":
+                            success_message += f" Confirmation number: {confirmation_number}."
+                        else:
+                            success_message += f" Bekreftelsesnummer: {confirmation_number}."
+
+                    if self._language_code() == "en":
+                        success_message += " If you need anything else regarding this booking, feel free to ask."
+                    else:
+                        success_message += " Hvis du trenger mer hjelp med denne bookingen, er det bare å si ifra."
 
                     return {
                         "suksess": True,

@@ -8,6 +8,121 @@ import config.constants as cfg
 OPUS_API_URL = cfg.OPUS_API_URL
 OPUS_BEARER_TOKEN = cfg.OPUS_BEARER_TOKEN
 
+async def get_patient_bookings(
+    *,
+    business_id: str,
+    pid: str,
+    use_test_environment: Optional[bool] = None,
+) -> List[Dict]:
+    """
+    Fetch bookings for a patient.
+    GET /api/Opus/patients/{pid}/bookings?businessId=<guid>&useTestEnvironment=false
+    """
+    if not OPUS_BEARER_TOKEN:
+        print("[OPUS] Warning: OPUS_BEARER_TOKEN not set.")
+        return []
+    if not business_id or not pid:
+        return []
+
+    use_test = use_test_environment if use_test_environment is not None else cfg.OPUS_USE_TEST_ENV
+    url = f"{OPUS_API_URL}/api/Opus/patients/{pid}/bookings"
+    params = {
+        "businessId": business_id,
+        "useTestEnvironment": "true" if use_test else "false",
+    }
+    headers = {
+        "Authorization": f"Bearer {OPUS_BEARER_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    full_url = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    print("[OPUS API] ========== PATIENT BOOKINGS REQUEST ==========")
+    print(f"[OPUS API] GET {full_url}")
+    print(f"[OPUS API] Headers: Accept=application/json, Authorization=Bearer ***")
+    print("[OPUS API] =============================================")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers) as response:
+                text_response = await response.text()
+                print(f"[OPUS API] PATIENT BOOKINGS Response Status: {response.status}")
+                if response.status != 200:
+                    print(f"[OPUS API] PATIENT BOOKINGS Error: {text_response[:500]}")
+                    return []
+                try:
+                    data = json.loads(text_response) if text_response else []
+                except json.JSONDecodeError:
+                    return []
+
+                # Response may be list or wrapped object.
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict):
+                    maybe = data.get("bookings") or data.get("data") or data.get("items")
+                    if isinstance(maybe, list):
+                        return maybe
+                return []
+    except Exception as e:
+        print(f"[OPUS] Exception in get_patient_bookings: {e}")
+        return []
+
+
+async def cancel_booking_opus(
+    *,
+    business_id: str,
+    booking_id: str,
+    pid: str,
+    use_test_environment: Optional[bool] = None,
+) -> Dict:
+    """
+    Cancel a booking via OPUS.
+    Endpoint: /api/Opus/bookings/cancel?businessId=...&bookingId=...&pid=...&useTestEnvironment=false
+    """
+    if not OPUS_BEARER_TOKEN:
+        print("[OPUS] Warning: OPUS_BEARER_TOKEN not set.")
+        return {"success": False, "message": "OPUS API token not configured"}
+    if not business_id or not booking_id or not pid:
+        return {"success": False, "message": "Missing required cancel parameters"}
+
+    use_test = use_test_environment if use_test_environment is not None else cfg.OPUS_USE_TEST_ENV
+    url = f"{OPUS_API_URL}/api/Opus/bookings/cancel"
+    params = {
+        "businessId": business_id,
+        "bookingId": booking_id,
+        "pid": pid,
+        "useTestEnvironment": "true" if use_test else "false",
+    }
+    headers = {
+        "Authorization": f"Bearer {OPUS_BEARER_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    full_url = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    print("[OPUS API] ========== CANCEL BOOKING REQUEST ==========")
+    print(f"[OPUS API] POST {full_url}")
+    print(f"[OPUS API] Headers: Accept=application/json, Authorization=Bearer ***")
+    print("[OPUS API] ===========================================")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, params=params, headers=headers) as response:
+                text_response = await response.text()
+                print(f"[OPUS API] CANCEL BOOKING Response Status: {response.status}")
+                try:
+                    data = json.loads(text_response) if text_response else {}
+                except json.JSONDecodeError:
+                    data = {}
+
+                if response.status == 200:
+                    return {"success": True, "message": data.get("message") or "Booking cancelled", "data": data}
+
+                err = data.get("message", text_response) or f"HTTP {response.status}"
+                print(f"[OPUS] Cancel booking failed. Status: {response.status}, Response: {text_response[:500]}")
+                return {"success": False, "message": err, "data": data}
+    except Exception as e:
+        print(f"[OPUS] Exception in cancel_booking_opus: {e}")
+        return {"success": False, "message": str(e)}
+
 async def get_clinic_treatments(business_id: str) -> List[Dict]:
     """
     Fetch all available treatments for a clinic from Opus API.

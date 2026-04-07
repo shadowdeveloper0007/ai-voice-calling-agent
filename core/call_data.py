@@ -7,7 +7,8 @@ from typing import List, Dict, Optional, Any
 @dataclass
 class CallData:
     """Data structure to track call information"""
-    phone_number: str = ""
+    phone_number: str = ""  # Agent/business phone (from room name)
+    caller_phone: str = ""  # Customer's calling number (from room name user_number or SIP identity)
     business_id: str = ""  # Store business_id for API calls (timeslots, booking, etc.)
     call_start_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     appointment_booked: bool = False
@@ -16,6 +17,7 @@ class CallData:
     dtmf_digits: List[str] = field(default_factory=list)
     collected_personnummer: str = ""  # Store collected personnummer for reuse
     alternative_phone_number: str = ""  # Store DTMF-collected phone number
+    phone_choice_confirmed: bool = False  # Caller confirmed calling number vs different number for booking
     language: str = "no"  # Current conversation language: "no" for Norwegian, "en" for English (can be changed anytime on explicit user request)
     is_console_mode: bool = False  # Flag to indicate console mode for auto-fill
     booking_preference: Optional[str] = None  # "first_available", "specific_date", or None

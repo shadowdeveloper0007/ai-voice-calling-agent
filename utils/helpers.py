@@ -1,3 +1,4 @@
+import re
 from typing import Optional
 
 
@@ -50,12 +51,71 @@ async def generate_conversation_summary(call_data) -> str:
 
 
 def extract_phone_from_room_name(room_name: str) -> Optional[str]:
-    """Extract phone number from room name format like _+4747788636_FccScBRpKxpE"""
-    if room_name.startswith('_+'):
-        parts = room_name.split('_')
-        if len(parts) >= 2:
-            return parts[1]  # Returns '+4747788636'
-    return None
+    """Legacy wrapper — returns agent_number for backward compat."""
+    parsed = parse_room_name(room_name)
+    return parsed.get("agent_number")
+
+
+def parse_room_name(room_name: str) -> dict:
+    """
+    Parse a LiveKit room name into business_id, agent_number, and user_number.
+
+    Supported format (new):
+      ``bid=<uuid>-an=<digits>_<user_phone>_<suffix>``
+      e.g. ``bid=9ebf79ad-ff71-4205-8988-08ddfe66e5a9-an=4723507256_+37066187886_FccScBRpKxpE``
+
+    Legacy format:
+      ``_+4747788636_FccScBRpKxpE``  (only agent number)
+
+    Returns dict with keys: business_id, agent_number, user_number (all Optional[str]).
+    """
+    result: dict = {"business_id": None, "agent_number": None, "user_number": None}
+    if not room_name:
+        return result
+
+    try:
+        parts = room_name.split("_")
+        prefix = parts[0] if parts else ""
+
+        # user_number is always the second underscore-separated segment
+        user_number = parts[1] if len(parts) > 1 else None
+        if user_number:
+            user_number = user_number.strip()
+            if user_number and not user_number.startswith("+"):
+                user_number = f"+{user_number}"
+            result["user_number"] = user_number
+
+        # business_id: bid=<uuid>
+        bid_match = re.search(
+            r"bid=([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})",
+            prefix,
+        )
+        if bid_match:
+            result["business_id"] = bid_match.group(1)
+
+        # agent_number: an=<digits>
+        an_match = re.search(r"an=(\+?[\d]+)", prefix)
+        if an_match:
+            n = an_match.group(1)
+            result["agent_number"] = n if n.startswith("+") else f"+{n}"
+
+        # Legacy fallback: `_+47..._...`
+        if not result["agent_number"] and room_name.startswith("_+") and len(parts) >= 2:
+            result["agent_number"] = parts[1]
+            result["user_number"] = None  # legacy has no separate user number
+
+        # Legacy fallback: `biz-...-num-<digits>_...`
+        if not result["agent_number"]:
+            m = re.search(r"(?:^|-)num-(\+?\d{8,15})", prefix)
+            if m:
+                n = m.group(1)
+                result["agent_number"] = n if n.startswith("+") else f"+{n}"
+
+        print(f"[ROOM PARSE] room_name={room_name!r} -> {result}")
+    except Exception as e:
+        print(f"[ROOM PARSE] Could not parse room name: {e}")
+
+    return result
 
 
 # --- Commented-out Qdrant conversation logging functions ---

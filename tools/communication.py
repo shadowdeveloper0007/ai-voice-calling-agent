@@ -74,11 +74,11 @@ class CommunicationToolsMixin:
             
             if error_code == 'not_found':
                 print(f"ERROR: SIP trunk '{sip_trunk_id}' not found in LiveKit. Please verify:")
-                print(f"  1. SIP trunk ID in environment variable SIP_TRUNK_ID is correct")
-                print(f"  2. SIP trunk exists in LiveKit dashboard")
-                print(f"  3. SIP trunk ID format is correct (should start with 'ST_' or similar)")
+                print("  1. SIP trunk ID in environment variable SIP_TRUNK_ID is correct")
+                print("  2. SIP trunk exists in LiveKit dashboard")
+                print("  3. SIP trunk ID format is correct (should start with 'ST_' or similar)")
             elif error_code == 'invalid_argument':
-                print(f"ERROR: Invalid argument provided. Check:")
+                print("ERROR: Invalid argument provided. Check:")
                 print(f"  - Phone number format: {ekstern_nummer}")
                 print(f"  - Room name: {self.job_context.room.name if self.job_context.room else 'None'}")
                 print(f"  - SIP trunk ID: {sip_trunk_id}")
@@ -281,38 +281,62 @@ class CommunicationToolsMixin:
     
     @function_tool()
     async def hent_telefonnummer_fra_samtale(self, context: RunContext) -> str:
-        """Henter telefonnummeret kunden ringer fra"""
-        if self.call_data and self.call_data.phone_number:
-            return self.call_data.phone_number
+        """Henter telefonnummeret kunden ringer fra (caller_phone)."""
+        if self.call_data:
+            num = self.call_data.caller_phone or self.call_data.phone_number
+            if num:
+                return num
         return self._get_text("phone_number_unavailable") or ("Phone number not available" if self._language_code() == "en" else "Telefonnummer ikke tilgjengelig")
+
+    @function_tool()
+    async def confirm_phone_number_for_booking(self, context: RunContext, use_calling_number: bool) -> str:
+        """
+        Confirm which phone number to use for booking.
+
+        - If use_calling_number=true: mark confirmed and use caller_phone for booking.
+        - If use_calling_number=false: collect a different phone via samle_telefonnummer_med_dtmf() and mark confirmed.
+        """
+        if not self.call_data:
+            return "Ingen aktive samtaledata tilgjengelig." if self._language_code() == "no" else "No call data available."
+
+        if use_calling_number:
+            self.call_data.phone_choice_confirmed = True
+            return "Takk! Jeg bruker nummeret du ringer fra." if self._language_code() == "no" else "Thanks! I’ll use the number you’re calling from."
+
+        await self.samle_telefonnummer_med_dtmf(context)
+        self.call_data.phone_choice_confirmed = True
+        if self._language_code() == "en":
+            return "Thanks! I’ll use the new number you entered."
+        return "Takk! Jeg bruker det nye nummeret du tastet inn."
     
     def _get_language_messages(self) -> dict:
-        """Get language-specific messages based on current language"""
+        """Base language-specific messages (instruction may be overridden by purpose)."""
         if self.call_data and self.call_data.language == "en":
             return {
-                "already_collected": "Personal ID number is already stored and will be automatically used for all booking functions. You do NOT need to collect it again. IMPORTANT: Continue speaking in English.",
-                "instruction": "Please enter your personal identification number on your phone followed by the hash key.",
+                "already_collected": "Thanks — I already have your personal ID number saved, so you don’t need to enter it again.",
+                "instruction": "Please enter your 11-digit personal ID number on your phone keypad, then press #.",
                 "confirmation": "Thank you, received personal ID number ending in {last_four}.",
-                "timeout": "Customer was unable to enter personal ID number correctly. IMPORTANT: Continue speaking in English.",
-                "retry": "Sorry, please try again. Enter eleven digits followed by the hash key.",
-                "invalid": "That number didn't look valid. Please enter eleven digits followed by the hash key.",
-                "stored": "Personal ID number is stored and will be automatically used for all booking functions. You do NOT need to collect it again. IMPORTANT: Continue speaking in English for all subsequent responses."
+                "timeout": "I didn’t catch that. Please try again: enter 11 digits, then press hash key.",
+                "retry": "Sorry — please try again: enter 11 digits, then press hash key.",
+                "invalid": "That didn’t look like 11 digits. Please re-enter your personal ID number, then press hash key.",
+                "stored": "Thanks — your personal ID number is saved for this call."
             }
         else:
             return {
-                "already_collected": "Personnummer er lagret og vil bli automatisk brukt for alle booking-funksjoner. Du trenger IKKE samle det på nytt.",
-                "instruction": "Venligst tast inn personnummeret ditt på telefonen din etterfulgt av firkanttegnet.",
+                "already_collected": "Takk — jeg har allerede lagret personnummeret ditt, så du trenger ikke taste det inn igjen.",
+                "instruction": "Tast inn personnummeret ditt (11 siffer), og trykk deretter firkanttast.",
                 "confirmation": "Takk, mottatt personnummer som slutter på {last_four}.",
-                "timeout": "Kunde klarte ikke taste inn personnummer korrekt",
-                "retry": "Beklager, prøv igjen. Tast elleve siffer etterfulgt av firkanttast.",
-                "invalid": "Det nummeret var ikke gyldig. Tast elleve siffer etterfulgt av firkanttast.",
-                "stored": "Personnummer er lagret og vil bli automatisk brukt for alle booking-funksjoner. Du trenger IKKE samle det på nytt."
+                "timeout": "Jeg fikk ikke med meg det. Prøv igjen: tast 11 siffer, og trykk deretter firkanttast.",
+                "retry": "Beklager — prøv igjen: tast 11 siffer, og trykk deretter firkanttast.",
+                "invalid": "Det så ikke ut som 11 siffer. Tast personnummeret på nytt, og trykk deretter firkanttast.",
+                "stored": "Takk — personnummeret er lagret for denne samtalen."
             }
 
     @function_tool()
     async def samle_personnummer_med_dtmf(
         self, 
-        context: RunContext
+        context: RunContext,
+        purpose: str = "booking",
     ) -> str:
         """Collects personal identification number via DTMF for secure and precise registration.
         
@@ -336,21 +360,35 @@ class CommunicationToolsMixin:
         DO NOT proceed with booking/cancellation until this function successfully collects and stores the personal ID number.
         If the function returns an error message, you may need to call it again."""
         
-        print(f"[PERSONNUMMER] ===== FUNCTION CALLED =====")
+        print("[PERSONNUMMER] ===== FUNCTION CALLED =====")
         print(f"[PERSONNUMMER] Current buffer at start: '{''.join(self.call_data.dtmf_digits) if self.call_data else 'NO CALL DATA'}'")
         print(f"[PERSONNUMMER] Previously collected personnummer: '{self.call_data.collected_personnummer if self.call_data else 'N/A'}'")
         
         messages = self._get_language_messages()
+        p = (purpose or "booking").strip().lower()
+        if p not in {"booking", "cancellation"}:
+            p = "booking"
+        # Purpose-specific instruction (more human-friendly)
+        if self.call_data and self.call_data.language == "en":
+            if p == "cancellation":
+                messages["instruction"] = "For cancellation, please enter your 11-digit personal ID number on your phone keypad, then press #."
+            else:
+                messages["instruction"] = "For booking, please enter your 11-digit personal ID number on your phone keypad, then press hash key."
+        else:
+            if p == "cancellation":
+                messages["instruction"] = "For avlysning, tast inn personnummeret ditt (11 siffer), og trykk deretter firkanttast."
+            else:
+                messages["instruction"] = "For bestilling, tast inn personnummeret ditt (11 siffer), og trykk deretter firkanttast."
         
         if not self.call_data:
             raise ValueError("No call data available for DTMF collection")
         
-        print(f"[PERSONNUMMER] Resetting for fresh collection - clearing previous data")
+        print("[PERSONNUMMER] Resetting for fresh collection - clearing previous data")
         self.call_data.collected_personnummer = ""
         self.call_data.dtmf_digits.clear()
         
         if self.call_data.is_console_mode:
-            console_personnummer = "23212123212"
+            console_personnummer = "12345678912"
             self.call_data.collected_personnummer = console_personnummer
             context.session.say(
                 messages["confirmation"].format(last_four=console_personnummer[-4:]),
@@ -373,7 +411,7 @@ class CommunicationToolsMixin:
         dtmf_event = self._prepare_dtmf_event()
         last_buffer_check = ""
         
-        print(f"[PERSONNUMMER] ===== STARTING DTMF COLLECTION LOOP =====")
+        print("[PERSONNUMMER] ===== STARTING DTMF COLLECTION LOOP =====")
         print(f"[PERSONNUMMER] Initial buffer: '{''.join(self.call_data.dtmf_digits)}'")
         
         loop_count = 0
@@ -395,7 +433,7 @@ class CommunicationToolsMixin:
                     print(f"[PERSONNUMMER] Hash check: has_hash_in_list={has_hash_in_list}, has_hash_in_string={has_hash_in_string}, buffer='{current_buffer}'")
             
             if has_hash_in_list or has_hash_in_string:
-                print(f"[PERSONNUMMER] ✓✓✓ HASH KEY DETECTED! Processing validation NOW...")
+                print("[PERSONNUMMER] ✓✓✓ HASH KEY DETECTED! Processing validation NOW...")
                 print(f"[PERSONNUMMER] Buffer: '{current_buffer}', List: {self.call_data.dtmf_digits}")
                 
                 try:
@@ -432,10 +470,10 @@ class CommunicationToolsMixin:
                         self.call_data.dtmf_digits.clear()
                         if dtmf_event:
                             dtmf_event.clear()
-                        print(f"[PERSONNUMMER] FUNCTION COMPLETE - Returning immediately")
+                        print("[PERSONNUMMER] FUNCTION COMPLETE - Returning immediately")
                         return messages["stored"]
                     else:
-                        print(f"[PERSONNUMMER] ✗ Invalid format (non-digits)")
+                        print("[PERSONNUMMER] ✗ Invalid format (non-digits)")
                         self.call_data.dtmf_digits.clear()
                         context.session.say(
                             messages.get("invalid", messages["retry"]),
@@ -552,7 +590,7 @@ class CommunicationToolsMixin:
         
         Do NOT ask the customer to provide phone number verbally - ALWAYS use this DTMF collection function."""
         
-        print(f"[PHONE] ===== FUNCTION CALLED =====")
+        print("[PHONE] ===== FUNCTION CALLED =====")
         print(f"[PHONE] Current buffer at start: '{''.join(self.call_data.dtmf_digits) if self.call_data else 'NO CALL DATA'}'")
         print(f"[PHONE] Previously collected phone number: '{self.call_data.alternative_phone_number if self.call_data else 'N/A'}'")
         
@@ -561,7 +599,7 @@ class CommunicationToolsMixin:
         if not self.call_data:
             raise ValueError("No call data available")
         
-        print(f"[PHONE] Resetting for fresh collection - clearing previous data")
+        print("[PHONE] Resetting for fresh collection - clearing previous data")
         self.call_data.alternative_phone_number = ""
         self.call_data.dtmf_digits.clear()
         
@@ -588,11 +626,11 @@ class CommunicationToolsMixin:
         start_time = time.time()
         dtmf_event = self._prepare_dtmf_event()
         if dtmf_event is None:
-            print(f"[PHONE] WARNING: dtmf_event is None after _prepare_dtmf_event()")
+            print("[PHONE] WARNING: dtmf_event is None after _prepare_dtmf_event()")
         last_buffer_check = ""
         
         loop_count = 0
-        print(f"[PHONE] Starting DTMF collection loop...")
+        print("[PHONE] Starting DTMF collection loop...")
         while True:
             loop_count += 1
             if loop_count % 500 == 0:
@@ -613,7 +651,7 @@ class CommunicationToolsMixin:
                     print(f"[PHONE] Waiting for hash... Current digits: '{current_buffer}'")
             
             if has_hash_in_list or has_hash_in_string:
-                print(f"[PHONE] ✓✓✓ HASH KEY DETECTED! Processing validation NOW...")
+                print("[PHONE] ✓✓✓ HASH KEY DETECTED! Processing validation NOW...")
                 print(f"[PHONE] Buffer: '{current_buffer}', List: {self.call_data.dtmf_digits}")
                 
                 try:
@@ -679,7 +717,7 @@ class CommunicationToolsMixin:
                         response_text = response_text.lower() if response_text else ""
                         print(f"[PHONE] User confirmation response: '{response_text}'")
                     except asyncio.TimeoutError:
-                        print(f"[PHONE] Timeout waiting for confirmation, assuming correct")
+                        print("[PHONE] Timeout waiting for confirmation, assuming correct")
                         response_text = ""
                     finally:
                         if self.call_data:
@@ -696,10 +734,10 @@ class CommunicationToolsMixin:
                         self.call_data.dtmf_digits.clear()
                         if dtmf_event:
                             dtmf_event.clear()
-                        print(f"[PHONE] FUNCTION COMPLETE - Returning immediately")
+                        print("[PHONE] FUNCTION COMPLETE - Returning immediately")
                         return messages["stored"].format(phone_number=phone_number)
                     elif is_not_confirmed:
-                        print(f"[PHONE] User said number is incorrect, restarting from beginning...")
+                        print("[PHONE] User said number is incorrect, restarting from beginning...")
                         self.call_data.dtmf_digits.clear()
                         if dtmf_event:
                             dtmf_event.clear()
@@ -731,7 +769,7 @@ class CommunicationToolsMixin:
                     self.call_data.dtmf_digits.clear()
                     if dtmf_event:
                         dtmf_event.clear()
-                    print(f"[PHONE] FUNCTION COMPLETE - Returning immediately")
+                    print("[PHONE] FUNCTION COMPLETE - Returning immediately")
                     return messages["stored"].format(phone_number=phone_number)
 
             remaining = timeout_seconds - (time.time() - start_time)
@@ -755,10 +793,12 @@ class CommunicationToolsMixin:
             continue
 
     def get_phone_number_for_booking(self) -> str:
-        """Get the appropriate phone number for booking - alternative or calling number"""
+        """Get the appropriate phone number for booking: alternative > caller_phone > agent phone."""
         if self.call_data:
             if self.call_data.alternative_phone_number:
                 return self.call_data.alternative_phone_number
+            elif self.call_data.caller_phone:
+                return self.call_data.caller_phone
             elif self.call_data.phone_number:
                 return self.call_data.phone_number
         return ""

@@ -46,12 +46,12 @@ class GeneralToolsMixin:
         if language in ["en", "english", "engelsk"]:
             self.call_data.language = "en"
             if old_language == "no":
-                return "Language switched to English. IMPORTANT: You MUST now immediately repeat your last message to the customer in English. After repeating it, continue all future responses in English."
+                return "Language switched to English. Respond with a SHORT acknowledgment only (e.g. 'Sure, I can help you in English! How can I assist you?'). Do NOT repeat the full previous message. Continue all future responses in English."
             return "Language switched to English. Continue all future responses in English."
         elif language in ["no", "norwegian", "norsk"]:
             self.call_data.language = "no"
             if old_language == "en":
-                return "Språk byttet til norsk. VIKTIG: Du MÅ nå umiddelbart gjenta din siste melding til kunden på norsk. Etter at du har gjentatt den, fortsett alle fremtidige svar på norsk."
+                return "Språk byttet til norsk. Svar med en KORT bekreftelse (f.eks. 'Selvfølgelig, jeg kan hjelpe deg på norsk! Hva kan jeg gjøre for deg?'). IKKE gjenta hele forrige melding. Fortsett alle fremtidige svar på norsk."
             return "Språk byttet til norsk. Fortsett alle fremtidige svar på norsk."
         else:
             template = self._get_text("unknown_language")
